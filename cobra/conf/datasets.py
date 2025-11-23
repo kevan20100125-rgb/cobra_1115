@@ -109,6 +109,37 @@ class LLaVa_LVIS4V_LRV_Config(DatasetConfig):
     dataset_root_dir: Path = Path("data")
 
 
+# [Calibration-Only] Tiny TextVQA-based vision calibration set (100 images + generic prompts)
+@dataclass
+class TextVQA_100_Calib_Config(DatasetConfig):
+    """
+    Tiny, vision-focused calibration dataset using 100 TextVQA images.
+
+    - Annotation JSON: data/calibration/train_images_100.json
+      (each entry has keys: {"image", "text"})
+    - Images live under: /work/asdf1234/samples/textvqa/train_images_100
+
+    Notes:
+        - dataset_root_dir is set to "." so that relative paths like
+          "data/calibration/..." resolve under the project root.
+        - The image directory is absolute; when combined with dataset_root_dir
+          using pathlib, the absolute path is preserved.
+        - align / finetune stages share the same components so either stage
+          can be used for calibration.
+    """
+    dataset_id: str = "calib-textvqa-100"
+
+    align_stage_components: Tuple[Path, Path] = (
+        Path("data/calibration/train_images_100_llava.json"),
+        Path("/work/asdf1234/samples/textvqa/train_images_100"),
+    )
+    finetune_stage_components: Tuple[Path, Path] = (
+        Path("data/calibration/train_images_100_llava.json"),
+        Path("/work/asdf1234/samples/textvqa/train_images_100"),
+    )
+    dataset_root_dir: Path = Path(".")
+
+
 # === Define a Dataset Registry Enum for Reference & Validation =>> all *new* datasets must be added here! ===
 @unique
 class DatasetRegistry(Enum):
@@ -122,6 +153,9 @@ class DatasetRegistry(Enum):
 
     LLAVA_LVIS4V_LRV = LLaVa_LVIS4V_LRV_Config
 
+    # === Calibration-only tiny TextVQA set ===
+    TEXTVQA_100_CALIB = TextVQA_100_Calib_Config
+
     @property
     def dataset_id(self) -> str:
         return self.value.dataset_id
@@ -130,3 +164,4 @@ class DatasetRegistry(Enum):
 # Register Datasets in Choice Registry
 for dataset_variant in DatasetRegistry:
     DatasetConfig.register_subclass(dataset_variant.dataset_id, dataset_variant.value)
+

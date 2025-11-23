@@ -1,156 +1,69 @@
-# Byte-compiled / optimized / DLL files
+# ===========================
+# Python cache / build junk
+# ===========================
 __pycache__/
 *.py[cod]
-*$py.class
-
-# C extensions
 *.so
+*.pyd
 
-# Distribution / packaging
-.Python
-build/
-develop-eggs/
-dist/
-downloads/
-eggs/
-.eggs/
-lib/
-lib64/
-parts/
-sdist/
-var/
-wheels/
-pip-wheel-metadata/
-share/python-wheels/
-*.egg-info/
-.installed.cfg
-*.egg
-MANIFEST
+# ===========================
+# Virtual environments
+# ===========================
+.env/
+.venv/
 
-# PyInstaller
-#  Usually these files are written by a python script from a template
-#  before PyInstaller builds the exe, so as to inject date/other infos into it.
-*.manifest
-*.spec
+# ===========================
+# Experiment / quantization outputs
+# ===========================
+# 整個 outputs 視為實驗結果，不進版本控制
+outputs/
 
-# Installer logs
-pip-log.txt
-pip-delete-this-directory.txt
+# 所有大型二進位 weights / checkpoints
+*.pt
+*.pth
+*.bin
+*.ckpt
+*.npz
+*.npy
 
-# Unit test / coverage reports
-htmlcov/
-.tox/
-.nox/
-.coverage
-.coverage.*
-.cache
-nosetests.xml
-coverage.xml
-*.cover
-*.py,cover
-.hypothesis/
-.pytest_cache/
+# 若未來想保留某些小的權重，可以用 ! 應對例外
 
-# Translations
-*.mo
-*.pot
-
-# Django stuff:
-*.log
-local_settings.py
-db.sqlite3
-db.sqlite3-journal
-
-# Flask stuff:
-instance/
-.webassets-cache
-
-# Scrapy stuff:
-.scrapy
-
-# Sphinx documentation
-docs/_build/
-
-# PyBuilder
-target/
-
-# Jupyter Notebook
-.ipynb_checkpoints
-
-# IPython
-profile_default/
-ipython_config.py
-
-# pyenv
-.python-version
-
-# pipenv
-#   According to pypa/pipenv#598, it is recommended to include Pipfile.lock in version control.
-#   However, in case of collaboration, if having platform-specific dependencies or dependencies
-#   having no cross-platform support, pipenv may install dependencies that don't work, or not
-#   install all needed dependencies.
-#Pipfile.lock
-
-# PEP 582; used by e.g. github.com/David-OConnor/pyflow
-__pypackages__/
-
-# Celery stuff
-celerybeat-schedule
-celerybeat.pid
-
-# SageMath parsed files
-*.sage.py
-
-# Environments
-.env
-.venv
-env/
-venv/
-ENV/
-env.bak/
-venv.bak/
-
-# Spyder project settings
-.spyderproject
-.spyproject
-
-# Rope project settings
-.ropeproject
-
-# mkdocs documentation
-/site
-
-# mypy
-.mypy_cache/
-.dmypy.json
-dmypy.json
-
-# Pyre type checker
-.pyre/
-
-# Ruff
-.ruff_cache/
-
-# Auth Tokens / Hidden Files
-.hf_token
-.*_token
-
-# IDE Caches
-.idea/
-.vscode/
-pyrightconfig.json
-
-# Mac OS
-.DS_Store
-
-# Caches and Datasets
-cache/
+# ===========================
+# Data (原始資料不要進 repo)
+# ===========================
+# 預設整個 data/ 忽略
 data/
 
-# Runs and Results
-runs/
-results/
+# 但 calibration 的小 JSON 是 repo 配置的一部分，要保留
+!data/calibration/
+!data/calibration/train_images_100_llava.json
 
-# Test scripts
-test*.py
-*.sh
+# 如果之後你有更多「小、關鍵、可重建的設定檔」，
+# 也可以用類似 !data/... 的方式加回來
+
+# ===========================
+# Logs / Slurm outputs（未來用得到）
+# ===========================
+logs/
+log/
+*.log
+slurm-*.out
+slurm-*.err
+outputs/slurm/
+
+# ===========================
+# IDE / OS 雜物
+# ===========================
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+
+# ===========================
+# Repo 壓縮備份
+# ===========================
+cobra_1115_*.zip
+*.tar
+*.tar.gz
+

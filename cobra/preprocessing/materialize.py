@@ -16,7 +16,11 @@ from cobra.preprocessing.datasets import AlignDataset, FinetuneDataset
 from cobra.util.data_utils import PaddedCollatorForLanguageModeling
 
 # Dataset Initializers =>> Maps Stage --> cls()
-DATASET_INITIALIZER = {"align": AlignDataset, "finetune": FinetuneDataset, "full-finetune": FinetuneDataset}
+DATASET_INITIALIZER = {
+    "align": AlignDataset, 
+    "finetune": FinetuneDataset, 
+    "full-finetune": FinetuneDataset
+}
 
 
 def get_dataset_and_collator(
@@ -66,3 +70,4 @@ def get_dataset_and_collator(
 
     else:
         raise ValueError(f"Stage `{stage}` is not supported!")
+
