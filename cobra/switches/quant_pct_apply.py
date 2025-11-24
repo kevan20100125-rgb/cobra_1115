@@ -31,7 +31,9 @@ import draccus
 import torch
 
 from cobra.overwatch import initialize_overwatch
-from cobra.quantize.pct.best_percentile import get_optimal_percent_map
+from cobra.quantize.pct.best_percentile import (
+    get_best_percentile_map_with_traces,
+)
 from cobra.quantize.pct.apply import build_hi_lo_map
 
 overwatch = initialize_overwatch(__name__)
@@ -68,7 +70,7 @@ class PctApplyConfig:
             - "off"   : do not use heuristic best percentiles; instead use
                         `default_percentile` for all hooks.
             - "apply" : compute a best-percentile map using
-                        `get_optimal_percent_map(...)`.
+                        `get_best_percentile_map_with_traces(...)`.
     default_percentile:
         Fallback percentile when best-percentile is disabled or when a hook
         has no explicit override.
@@ -121,7 +123,7 @@ def _load_pct_stats(path: Path) -> Mapping[str, Mapping[str, float]]:
 
 def _summarize_hi_lo_map(
     hi_lo_map: Mapping[str, Mapping[str, float]],
-    ) -> Dict[str, Dict[str, float]]:
+) -> Dict[str, Dict[str, float]]:
     """
     Build a compact, JSON-serializable summary from hi_lo_map.
 
@@ -129,7 +131,7 @@ def _summarize_hi_lo_map(
         {
           "<hook_name>": {
               "target": "vision.dino" | "vision.siglip" | "llm" | "projector",
-              "percentile": 99.9,
+              "percent": 99.9,
               "hi": <float>,
               "lo": <float>,
               ...
@@ -196,14 +198,18 @@ def quant_pct_apply(cfg: PctApplyConfig) -> None:
     stats = _load_pct_stats(cfg.pct_stats_in)
 
     # -------------------------------------------------------------------------
-    # 2) Compute best-percentile map (optional)
+    # 2) Compute best-percentile map (optional) + collect traces
     # -------------------------------------------------------------------------
     best_percent_map: Optional[Dict[str, float]] = None
+    trace_map: Dict[str, Sequence[object]] = {}
+
     if cfg.best_percentile == "apply":
         stages: Optional[Tuple[str, ...]] = cfg.resolved_targets()
-        best_percent_map = get_optimal_percent_map(
+
+        # New: use API that also returns per-target RuleTrace list
+        best_percent_map, trace_map = get_best_percentile_map_with_traces(
             stats=stats,
-            stages=stages,
+            include_targets=stages,
         )
 
         overwatch.info("[quant_pct_apply] Best-percentile map computed")
@@ -235,7 +241,7 @@ def quant_pct_apply(cfg: PctApplyConfig) -> None:
     torch.save(hi_lo_map, cfg.pct_hi_lo_out)
 
     # -------------------------------------------------------------------------
-    # 4) Human-readable summary
+    # 4) Human-readable summary (含 best clipping 統計)
     # -------------------------------------------------------------------------
     summary = {
         "config": {
@@ -251,12 +257,59 @@ def quant_pct_apply(cfg: PctApplyConfig) -> None:
         "entries": _summarize_hi_lo_map(hi_lo_map),
     }
 
-    # Aggregate counts by target
+    # 4A) Aggregate counts by target
     by_target: Dict[str, int] = {}
     for hook, info in hi_lo_map.items():
         tgt = info.get("target", "unknown") if isinstance(info, Mapping) else "unknown"
         by_target[tgt] = by_target.get(tgt, 0) + 1
     summary["by_target"] = by_target
+
+    # 4B) Best-percentile statistics per target（module-level percentile histogram）
+    percentile_hist: Dict[str, Dict[str, int]] = {}
+    all_percents: list[float] = []
+
+    for info in hi_lo_map.values():
+        if not isinstance(info, Mapping):
+            continue
+        tgt = str(info.get("target", "unknown"))
+        if "percent" not in info:
+            continue
+        p = float(info["percent"])
+        all_percents.append(p)
+
+        tgt_hist = percentile_hist.setdefault(tgt, {})
+        # 使用固定小數位數方便閱讀與 group
+        p_key = f"{p:.3f}"
+        tgt_hist[p_key] = tgt_hist.get(p_key, 0) + 1
+
+    summary["percentile_hist"] = percentile_hist
+
+    # 4C) Rule usage statistics (per target, per RuleTrace.rule)
+    rule_stats: Dict[str, Dict[str, int]] = {}
+    for tgt, traces in trace_map.items():
+        tgt_stats = rule_stats.setdefault(tgt, {})
+        for tr in traces:
+            rule_name = getattr(tr, "rule", "<unknown>")
+            tgt_stats[rule_name] = tgt_stats.get(rule_name, 0) + 1
+
+    summary["rule_stats"] = rule_stats
+
+    # 4D) Global percentile statistics（mean / min / max）
+    if all_percents:
+        mean_p = float(sum(all_percents) / len(all_percents))
+        min_p = float(min(all_percents))
+        max_p = float(max(all_percents))
+        summary["global_percent_stats"] = {
+            "mean": mean_p,
+            "min": min_p,
+            "max": max_p,
+        }
+    else:
+        summary["global_percent_stats"] = {
+            "mean": None,
+            "min": None,
+            "max": None,
+        }
 
     _save_json(summary, cfg.pct_summary_out)
 
@@ -271,3 +324,4 @@ def quant_pct_apply(cfg: PctApplyConfig) -> None:
 
 if __name__ == "__main__":
     quant_pct_apply()
+
