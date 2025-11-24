@@ -75,6 +75,11 @@ class RuleTrace:
     chosen_percent: float
     candidates: List[float]
 
+    # Optional metadata for richer analysis (record-level context)
+    record_name: Optional[str] = None
+    target: Optional[str] = None
+    module: Optional[str] = None
+
 
 # ---------------------------------------------------------------------------
 # Internal helpers
@@ -206,6 +211,11 @@ def _compute_best_for_record(
     _, p50, _, S = _compute_robust_scale(view.pcts)
     best, trace = _select_from_tail(view.pcts, min_base=90.0, tau_growth=tau_growth)
 
+    # Attach record-level metadata (helps downstream analysis).
+    trace.record_name = view.name
+    trace.target = view.target
+    trace.module = view.module
+
     # Attach a simple sanity check via z-score; if the chosen percentile
     # is extremely far from the median, we can clamp to a slightly lower one.
     lookup = {p: v for p, v in view.pcts}
@@ -216,7 +226,14 @@ def _compute_best_for_record(
         # pick second-highest percentile as a conservative fallback
         alt = sorted([p for p, _ in view.pcts])[-2]
         best = alt
-        trace = RuleTrace(rule="zscore_clamp", chosen_percent=best, candidates=trace.candidates)
+        trace = RuleTrace(
+            rule="zscore_clamp",
+            chosen_percent=best,
+            candidates=trace.candidates,
+            record_name=view.name,
+            target=view.target,
+            module=view.module,
+        )
 
     return best, trace
 
@@ -395,3 +412,4 @@ def get_optimal_percent_map(
         tau_growth=tau_growth,
         include_targets=include_targets,
     )
+

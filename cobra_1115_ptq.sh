@@ -135,6 +135,12 @@ cfg = QuantCalibrateConfig(
     pct_summary_out=pct_summary_out,
     dataset=calib_dataset_cfg,
     stage="align",
+
+    ###Smoke test
+    per_device_batch_size=2,
+    num_workers=0,
+    max_calib_batches=2,
+    max_samples_per_module=200_000,
 )
 
 quant_calibrate(cfg)
