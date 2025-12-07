@@ -1,0 +1,146 @@
+cobra_1115
+├── LICENSE
+├── Makefile
+├── README.md
+├── assets
+│   ├── cobra.png
+│   └── cobra_demo.gif
+├── cobra
+│   ├── __init__.py
+│   ├── conf
+│   │   ├── __init__.py
+│   │   ├── datasets.py
+│   │   └── models.py
+│   ├── integration
+│   │   ├── __init__.py
+│   │   └── wrap_replace.py
+│   ├── models
+│   │   ├── __init__.py
+│   │   ├── backbones
+│   │   │   ├── __init__.py
+│   │   │   ├── llm
+│   │   │   │   ├── __init__.py
+│   │   │   │   ├── base_llm.py
+│   │   │   │   ├── mamba.py
+│   │   │   │   └── prompting
+│   │   │   │       ├── __init__.py
+│   │   │   │       ├── base_prompter.py
+│   │   │   │       ├── mamba_prompter.py
+│   │   │   │       └── zephyr_prompter.py
+│   │   │   └── vision
+│   │   │       ├── __init__.py
+│   │   │       ├── base_vision.py
+│   │   │       ├── clip_vit.py
+│   │   │       ├── dinoclip_vit.py
+│   │   │       ├── dinosiglip_vit.py
+│   │   │       ├── dinov2_vit.py
+│   │   │       ├── in1k_vit.py
+│   │   │       └── siglip_vit.py
+│   │   ├── load.py
+│   │   ├── mamba
+│   │   │   ├── configuration_mamba.py
+│   │   │   └── modeling_mamba.py
+│   │   ├── materialize.py
+│   │   ├── registry.py
+│   │   └── vlms
+│   │       ├── __init__.py
+│   │       ├── base_vlm.py
+│   │       └── cobra.py
+│   ├── overwatch
+│   │   ├── __init__.py
+│   │   └── overwatch.py
+│   ├── preprocessing
+│   │   ├── __init__.py
+│   │   ├── datasets
+│   │   │   ├── __init__.py
+│   │   │   └── datasets.py
+│   │   ├── download.py
+│   │   └── materialize.py
+│   ├── py.typed
+│   ├── quantize
+│   │   ├── __init__.py
+│   │   ├── cli_compare_export_bits.py
+│   │   ├── finalize
+│   │   │   └── int_export.py
+│   │   ├── get_haar_matrix.py
+│   │   ├── get_klt_matrix.py
+│   │   ├── gptq.py
+│   │   ├── hadamard_utils.py
+│   │   ├── hadmard.py
+│   │   ├── hm_model_utils.py
+│   │   ├── int_conv.py
+│   │   ├── int_linear.py
+│   │   ├── int_matmul.py
+│   │   ├── int_others.py
+│   │   ├── normalized_modules.py
+│   │   ├── observers
+│   │   │   ├── __init__.py
+│   │   │   ├── _hist_manager.py
+│   │   │   ├── _register.py
+│   │   │   ├── hist_observers.py
+│   │   │   ├── minmax_observers.py
+│   │   │   ├── observer_abc.py
+│   │   │   ├── quant_param.py
+│   │   │   └── utils.py
+│   │   ├── pct
+│   │   │   ├── apply.py
+│   │   │   ├── best_percentile.py
+│   │   │   ├── calibrator.py
+│   │   │   ├── collect.py
+│   │   │   └── schema.py
+│   │   ├── plot_utils
+│   │   │   ├── analyse_mamba.py
+│   │   │   ├── analyse_vim_plot.py
+│   │   │   └── utils.py
+│   │   ├── quantizer.py
+│   │   ├── rotate
+│   │   │   ├── hadamard.py
+│   │   │   ├── klt.py
+│   │   │   └── projector.py
+│   │   ├── runtime
+│   │   │   └── load_quantized_vlm.py
+│   │   ├── utils.py
+│   │   └── wrap
+│   │       ├── entry.py
+│   │       ├── manifest.py
+│   │       ├── policy.py
+│   │       ├── registry.py
+│   │       └── utils.py
+│   ├── switches
+│   │   ├── quant_calibrate.py
+│   │   ├── quant_finalize.py
+│   │   ├── quant_klt.py
+│   │   └── quant_pct_apply.py
+│   ├── training
+│   │   ├── __init__.py
+│   │   ├── materialize.py
+│   │   ├── metrics.py
+│   │   └── strategies
+│   │       ├── __init__.py
+│   │       ├── base_strategy.py
+│   │       ├── ddp.py
+│   │       └── fsdp.py
+│   └── util
+│       ├── __init__.py
+│       ├── batching_utils.py
+│       ├── data_utils.py
+│       ├── nn_utils.py
+│       └── torch_utils.py
+├── cobra_1115_20251126.zip
+├── cobra_1115_ptq.sh
+├── cobra_vlm.egg-info
+│   ├── PKG-INFO
+│   ├── SOURCES.txt
+│   ├── dependency_links.txt
+│   ├── requires.txt
+│   └── top_level.txt
+├── pyproject.toml
+└── scripts
+    ├── additional-datasets
+    │   ├── lrv_instruct.py
+    │   └── lvis_instruct_4v.py
+    ├── generate.py
+    ├── preprocess.py
+    └── pretrain.py
+
+30 directories, 114 files

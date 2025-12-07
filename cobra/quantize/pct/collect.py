@@ -20,12 +20,18 @@ Key responsibilities:
 
 The actual *choice* of "best percentile" is delegated to `best_percentile.py`;
 this module only produces the raw empirical distribution summaries.
+
+NOTE:
+    The output is intentionally bit-agnostic. It only describes the activation
+    distribution; later stages (best-percentile selection + calibrator) will
+    convert these stats into hi/lo clipping ranges that can be reused for
+    different act_bits (e.g., 4-bit / 8-bit fake quant).
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Any, Dict, Iterable, List, Mapping, MutableMapping, Optional, Sequence, Tuple
+from dataclasses import dataclass, field
+from typing import Any, Dict, Mapping, Optional, Sequence, Tuple
 
 import torch
 from torch import nn
@@ -130,6 +136,98 @@ class ActivationCollector:
 
     def remove(self) -> None:
         self.handle.remove()
+
+# ---------------------------------------------------------------------------
+# LLM activation tap context (for models that cannot rely on module hooks)
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class LLMActivationTapContext:
+    """
+    Global context for collecting LLM activations via explicit tap calls.
+
+    This is designed for backbones (e.g., Mamba) where the core computation
+    does not flow through nn.Linear/nn.Conv modules' `forward` methods, so
+    traditional forward hooks cannot see the true activations.
+
+    Instead, the model code can call:
+
+        llm_tap_activation(target="llm", module_name="<qualified.name>", tensor=x)
+
+    and this context will keep a bounded reservoir of samples per (target, module),
+    reusing ActivationBuffer as the underlying storage.
+    """
+
+    enabled: bool = False
+    max_samples_per_module: int = 2_000_000
+    device: torch.device = torch.device("cpu")
+    buffers_by_key: Dict[str, ActivationBuffer] = field(default_factory=dict)
+
+
+_GLOBAL_LLM_TAP_CONTEXT: Optional[LLMActivationTapContext] = None
+
+
+def set_global_llm_tap_context(ctx: Optional[LLMActivationTapContext]) -> None:
+    """
+    Set or clear the global LLM tap context.
+
+    Typical usage:
+        ctx = LLMActivationTapContext(enabled=True, max_samples_per_module=..., device=...)
+        set_global_llm_tap_context(ctx)
+        # run calibration loop ...
+        set_global_llm_tap_context(None)
+    """
+    global _GLOBAL_LLM_TAP_CONTEXT
+    _GLOBAL_LLM_TAP_CONTEXT = ctx
+
+
+def get_global_llm_tap_context() -> Optional[LLMActivationTapContext]:
+    """
+    Return the current global LLM tap context (if any).
+    """
+    return _GLOBAL_LLM_TAP_CONTEXT
+
+
+def llm_tap_activation(target: str, module_name: str, tensor: torch.Tensor) -> None:
+    """
+    Explicit activation tap entry point for LLM backbones.
+
+    This is intended to be called from inside the model's forward pass, e.g.:
+
+        from cobra.quantize.pct.collect import llm_tap_activation
+        ...
+        llm_tap_activation("llm", "llm_backbone.llm.backbone.layers.0.mixer", hidden_states)
+
+    The behavior mirrors what a forward hook with an ActivationBuffer would do,
+    but does not rely on nn.Module.forward being invoked on Linear/Conv modules.
+    """
+    ctx = _GLOBAL_LLM_TAP_CONTEXT
+    if ctx is None or (not ctx.enabled):
+        return
+
+    if tensor is None:
+        return
+
+    norm_target = normalize_target(target)
+    key = f"{norm_target}::{module_name}"
+
+    buffer = ctx.buffers_by_key.get(key)
+    if buffer is None:
+        buffer = ActivationBuffer(
+            target=norm_target,
+            module_name=module_name,
+            max_samples=ctx.max_samples_per_module,
+            device=ctx.device,
+        )
+        ctx.buffers_by_key[key] = buffer
+
+        overwatch.debug(
+            f"[PctCollect][LLMTap] Created buffer for target={norm_target!r}, module={module_name!r}",
+            extra={"target": norm_target, "pct_module": module_name},
+        )
+
+    buffer.update(tensor)
 
 
 # ---------------------------------------------------------------------------
@@ -267,8 +365,8 @@ def build_activation_stats(
 
     Returns:
         stats: mapping from record-key to PercentileRecord, ready to be saved
-               (e.g. via torch.save) and later consumed by `best_percentile.py`
-               and `apply.py`.
+               (e.g. via torch.save) and later consumed by best-percentile
+               selection + pct.apply + calibrator.
     """
     if percentiles is None:
         percentiles = list(_DEFAULT_PERCENTILES)
@@ -278,6 +376,9 @@ def build_activation_stats(
 
     stats: Dict[str, PercentileRecord] = {}
 
+    # ------------------------------------------------------------------
+    # 1) Hook-based collectors (vision / projector / any module hooks)
+    # ------------------------------------------------------------------
     for key, col in collectors.items():
         buf = col.buffer
         if buf._storage is None or buf.numel == 0:
@@ -317,5 +418,52 @@ def build_activation_stats(
             extra={"target": col.target, "pct_module": col.module_name},
         )
 
+    # ------------------------------------------------------------------
+    # 2) LLM tap-based buffers (for backbones that bypass module hooks)
+    # ------------------------------------------------------------------
+    ctx = get_global_llm_tap_context()
+    if ctx is not None and ctx.enabled:
+        for key, buf in ctx.buffers_by_key.items():
+            # Avoid double-counting if a module also had a hook-based collector.
+            if key in stats:
+                continue
+
+            if buf._storage is None or buf.numel == 0:
+                # Use a slightly different tag to distinguish LLMTap warnings.
+                overwatch.warning(
+                    f"[PctCollect][LLMTap] No activations collected for target={buf.target!r}, "
+                    f"module={buf.module_name!r}; skipping.",
+                    extra={"target": buf.target, "pct_module": buf.module_name},
+                )
+                continue
+
+            x = buf._storage
+            x = x.detach().to("cpu", dtype=torch.float32)
+
+            record: PercentileRecord = {
+                "mode": mode,
+                "numel": int(x.numel()),
+                "target": buf.target,
+                "module": buf.module_name,
+                "min": float(x.min().item()),
+                "max": float(x.max().item()),
+            }
+
+            qs = torch.tensor([q / 100.0 for q in percentiles], dtype=torch.float32, device=x.device)
+            values = torch.quantile(x, qs)
+
+            for q, v in zip(percentiles, values.tolist()):
+                key_q = _format_percent_key(q)
+                record[key_q] = float(v)
+
+            stats[key] = record
+
+            overwatch.info(
+                f"[PctCollect][LLMTap] target={buf.target!r}, module={buf.module_name!r}, "
+                f"numel={record['numel']}, min={record['min']:.6f}, max={record['max']:.6f}",
+                extra={"target": buf.target, "pct_module": buf.module_name},
+            )
+
     return stats
+
 

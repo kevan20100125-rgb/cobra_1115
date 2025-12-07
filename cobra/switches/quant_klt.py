@@ -14,7 +14,10 @@ Responsibilities:
     4) Compute feature covariance C = (W_centered^T @ W_centered) / (N - 1).
     5) Compute eigen-decomposition C = Q Λ Q^T, and take K = Q (d_model x d_model).
     6) Save shared K to disk (e.g., outputs/quantize/shared_klt.pt), to be consumed by
-       `quant_finalize.py` (R = H K rotation).
+       both:
+         - `quant_finalize.py` for offline INT export (R = H K rotation), and
+         - runtime loaders (e.g. `quantize/runtime/load_quantized_vlm.py`) for
+           fake / INT backends that want to apply the same projector rotation.
 """
 
 from __future__ import annotations
@@ -33,7 +36,7 @@ from cobra.models import (
     get_vlm,
 )
 from cobra.overwatch import initialize_overwatch
-from cobra.switches.quant_finalize import _SHARED_KLT_PATH
+from cobra.quantize.rotate.projector import SHARED_KLT_PATH
 from cobra.util import set_global_seed
 
 overwatch = initialize_overwatch(__name__)
@@ -64,6 +67,9 @@ class QuantKLTConfig:
     ----------------
     klt_out:
         Where to save the shared K matrix (as dict{"K": Tensor}).
+        Default is `cobra.quantize.rotate.projector.SHARED_KLT_PATH`, so that
+        finalize + runtime backends can consume the same file without having
+        to re-agree on a hard-coded path here.
     device:
         "cuda" or "cpu" device for loading the model.
     seed:
@@ -79,7 +85,7 @@ class QuantKLTConfig:
     hf_token: Union[str, Path] = Path(".hf_token")
 
     # --- Output / runtime ---
-    klt_out: Path = _SHARED_KLT_PATH
+    klt_out: Path = SHARED_KLT_PATH
     device: str = "cuda"
     seed: int = 7
 
@@ -177,9 +183,8 @@ def _compute_klt_from_output_head(W: torch.Tensor) -> torch.Tensor:
 
         - Let W ∈ R^{N x d}, N = vocab_size, d = d_model.
         - Center columns: W_c = W - mean(W, dim=0).
-        - Compute covariance: C = (W_c^T @ W_c) / (N - 1) ∈ R^{d x d}.
-        - Eigen-decomposition: C = Q Λ Q^T.
-        - Use K = Q as the KLT matrix.
+        - Compute covariance: C = (W_c^T @ W_c) / (N - 1).
+        - Eigen-decomposition: C = Q Λ Q^T, and take K = Q as the KLT matrix.
 
     Args:
         W: weight matrix of shape (vocab_size, d_model), float tensor on CPU.

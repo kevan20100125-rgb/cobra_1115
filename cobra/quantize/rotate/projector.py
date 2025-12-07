@@ -22,12 +22,19 @@ Design goals:
         * Hadamard transform from `cobra.quantize.hadamard_utils`.
     - Keep this file free from percentile / quantizer / finalize logic.
       It only computes and applies rotations on weights.
+    - Centralize shared-KLT path and loading logic so that both:
+        * offline finalize (INT export), and
+        * online runtimes (fake / INT backends)
+      can use the exact same convention.
 
 Typical usage (inside a CLI like `quant_finalize.py`):
 
     from cobra.quantize.rotate.projector import (
         ProjectorRotationConfig,
-        rotate_llm_output_projector_inplace,
+        SHARED_KLT_PATH,
+        load_klt_matrix,
+        rotate_cobra_vlm_output_projector_inplace,
+        rotate_cobra_vlm_output_projector_from_path_inplace,
     )
 
     cfg = ProjectorRotationConfig(
@@ -36,20 +43,28 @@ Typical usage (inside a CLI like `quant_finalize.py`):
         shared_klt=True,
     )
 
-    # K: (d_model, d_model) precomputed shared KLT matrix, or None
-    rotate_llm_output_projector_inplace(
-        llm_backbone=llm_backbone,  # e.g. MambaLLMBackbone
+    # Option A: pass a K matrix explicitly
+    rotate_cobra_vlm_output_projector_inplace(
+        vlm,
         K=K,
         cfg=cfg,
     )
 
-After this call, `lm_head.weight` is replaced by the rotated weight
+    # Option B: let this module load K from disk
+    rotate_cobra_vlm_output_projector_from_path_inplace(
+        vlm,
+        klt_path=SHARED_KLT_PATH,
+        cfg=cfg,
+    )
+
+After these calls, `lm_head.weight` is replaced by the rotated weight
 W_out_rot, while activations y_t remain in float.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Optional, Tuple
 
 import torch
@@ -63,6 +78,69 @@ overwatch = initialize_overwatch(__name__)
 
 
 # ============================================================================
+# Shared KLT path & loader
+# ============================================================================
+
+#: Default shared-KLT matrix path.
+#:
+#: Centralized here so that:
+#:   - `quant_klt.py` (estimation),
+#:   - `quant_finalize.py` (offline INT export),
+#:   - `runtime/load_quantized_vlm.py` (online fake/INT backends)
+#: all agree on the same convention.
+SHARED_KLT_PATH: Path = Path("/work/asdf1234/cobra_1115/outputs/quantize/shared_klt.pt")
+
+
+def load_klt_matrix(path: Optional[Path]) -> Optional[torch.Tensor]:
+    """
+    Load a KLT matrix from disk.
+
+    The file may contain either:
+        - a bare Tensor, or
+        - a dict with one of the keys {"K", "klt", "KLT"} mapping to a Tensor.
+
+    The matrix is always loaded onto CPU; callers are responsible for moving
+    it to the desired device/dtype.
+
+    Parameters
+    ----------
+    path:
+        Path to the KLT file. If None, returns None.
+
+    Returns
+    -------
+    K:
+        Tensor containing the KLT matrix, or None if `path` is None.
+
+    Raises
+    ------
+    FileNotFoundError:
+        If `path` is not None and does not exist.
+    TypeError:
+        If the file exists but does not contain a suitable Tensor.
+    """
+    if path is None:
+        return None
+
+    if not path.is_file():
+        raise FileNotFoundError(f"KLT file not found at: {path}")
+
+    obj = torch.load(path, map_location="cpu")
+    if isinstance(obj, torch.Tensor):
+        return obj
+
+    if isinstance(obj, dict):
+        for key in ("K", "klt", "KLT"):
+            if key in obj and isinstance(obj[key], torch.Tensor):
+                return obj[key]
+
+    raise TypeError(
+        f"KLT file {path} must contain a Tensor or a dict with key 'K' or 'klt'/'KLT'; "
+        f"got {type(obj)}"
+    )
+
+
+# ============================================================================
 # Configuration
 # ============================================================================
 
@@ -73,7 +151,7 @@ class ProjectorRotationConfig:
     Configuration for output-projector rotation.
 
     Flags are intentionally high-level. Bitwidth / quantization mode is
-    handled in `finalize/int_export.py`, not here.
+    handled in `finalize/int_export.py` or runtime config modules, not here.
 
     Attributes
     ----------
@@ -264,7 +342,7 @@ def rotate_llm_output_projector_inplace(
       float and unrotated, matching the design "quantized x_t → Mamba →
       float y_t → quantized, rotated W_out".
     - It does not attach any quantization modules; those are handled by the
-      quantization / finalize pipeline.
+      quantization / finalize / runtime pipeline.
     """
     if cfg is None:
         cfg = ProjectorRotationConfig()
@@ -288,6 +366,46 @@ def rotate_llm_output_projector_inplace(
     )
 
     return module_path, lm_head
+
+
+def rotate_llm_output_projector_from_path_inplace(
+    llm_backbone: nn.Module,
+    *,
+    klt_path: Optional[Path],
+    cfg: Optional[ProjectorRotationConfig] = None,
+) -> Tuple[str, nn.Linear]:
+    """
+    Variant of `rotate_llm_output_projector_inplace` that loads K from disk.
+
+    This is a convenience entrypoint for callers that only know the KLT
+    file path (e.g., CLIs or runtimes) and do not want to manually handle
+    `torch.load`.
+
+    Args
+    ----
+    llm_backbone:
+        LLM backbone wrapper, e.g. `MambaLLMBackbone`.
+    klt_path:
+        Path to the KLT file (or None to skip KLT).
+    cfg:
+        ProjectorRotationConfig. If None, a default instance is used.
+
+    Returns
+    -------
+    (module_path, lm_head_module)
+        As in `rotate_llm_output_projector_inplace`.
+    """
+    if cfg is None:
+        cfg = ProjectorRotationConfig()
+
+    K = load_klt_matrix(klt_path) if klt_path is not None else None
+    if cfg.use_klt and K is None:
+        overwatch.warning(
+            "[ProjectorRotate] use_klt=True but loaded KLT matrix is None; "
+            "KLT part of rotation will be skipped."
+        )
+
+    return rotate_llm_output_projector_inplace(llm_backbone=llm_backbone, K=K, cfg=cfg)
 
 
 def rotate_cobra_vlm_output_projector_inplace(
@@ -330,3 +448,115 @@ def rotate_cobra_vlm_output_projector_inplace(
 
     llm_backbone = vlm.llm_backbone
     return rotate_llm_output_projector_inplace(llm_backbone=llm_backbone, K=K, cfg=cfg)
+
+
+def rotate_cobra_vlm_output_projector_from_path_inplace(
+    vlm: nn.Module,
+    *,
+    klt_path: Optional[Path],
+    cfg: Optional[ProjectorRotationConfig] = None,
+) -> Tuple[str, nn.Linear]:
+    """
+    Variant of `rotate_cobra_vlm_output_projector_inplace` that loads K from disk.
+
+    This is the natural entrypoint for:
+        - `quant_klt.py` + `quant_finalize.py` (offline INT export), and
+        - `runtime/load_quantized_vlm.py` (fake / INT runtime),
+
+    when they want to apply projector rotation using a shared KLT matrix saved
+    at a well-known location (e.g., `SHARED_KLT_PATH`).
+
+    This function is responsible for:
+        1) Loading the KLT matrix from `klt_path` (or deciding to skip KLT),
+        2) Calling `rotate_cobra_vlm_output_projector_inplace`,
+        3) Handling path / loading errors at this layer, so callers do not
+           need to duplicate error-handling logic.
+
+    Args
+    ----
+    vlm:
+        CobraVLM instance (`cobra.models.vlms.cobra.CobraVLM` compatible).
+    klt_path:
+        Path to the KLT file. If None, KLT will be skipped (depending on cfg).
+    cfg:
+        ProjectorRotationConfig. If None, a default instance is used.
+
+    Returns
+    -------
+    (module_path, lm_head_module)
+        As in `rotate_llm_output_projector_inplace`.
+
+    Notes
+    -----
+    - If `cfg.use_klt` is True but the KLT matrix cannot be loaded (missing
+      file / invalid contents), this function will log a warning and proceed
+      with K=None, so that Hadamard-only rotation can still be applied.
+    - Unexpected errors (e.g., torch.load internal failures) are re-raised
+      to avoid silently masking serious issues.
+    """
+    if not hasattr(vlm, "llm_backbone"):
+        raise AttributeError(
+            "[ProjectorRotate] Expected CobraVLM-like module with `llm_backbone` attribute."
+        )
+
+    if cfg is None:
+        cfg = ProjectorRotationConfig()
+
+    K: Optional[torch.Tensor] = None
+
+    # Handle KLT loading here so that callers do not need to worry about
+    # FileNotFoundError / TypeError, etc.
+    if klt_path is not None:
+        try:
+            K = load_klt_matrix(klt_path)
+            overwatch.info(
+                "[ProjectorRotate] Loaded shared KLT matrix for projector rotation.",
+                extra={
+                    "klt_path": str(klt_path),
+                    "use_klt": cfg.use_klt,
+                },
+            )
+        except FileNotFoundError:
+            if cfg.use_klt:
+                overwatch.warning(
+                    "[ProjectorRotate] use_klt=True but KLT file not found; "
+                    "KLT part of projector rotation will be skipped.",
+                    extra={"klt_path": str(klt_path)},
+                )
+            else:
+                overwatch.info(
+                    "[ProjectorRotate] KLT file not found but use_klt=False; "
+                    "this is expected, proceeding without K.",
+                    extra={"klt_path": str(klt_path)},
+                )
+            K = None
+        except TypeError as e:
+            # The file exists but contents are not usable as KLT matrix.
+            overwatch.warning(
+                "[ProjectorRotate] Failed to interpret KLT file contents; "
+                "KLT part of projector rotation will be skipped.",
+                extra={
+                    "klt_path": str(klt_path),
+                    "error": str(e),
+                },
+            )
+            K = None
+        except Exception as e:
+            # Unexpected failure: surface the error instead of silently skipping.
+            overwatch.error(
+                "[ProjectorRotate] Unexpected error while loading KLT matrix.",
+                extra={
+                    "klt_path": str(klt_path),
+                    "error": str(e),
+                },
+            )
+            raise
+
+    # Delegate to the core in-place rotation on the CobraVLM.
+    return rotate_cobra_vlm_output_projector_inplace(
+        vlm=vlm,
+        K=K,
+        cfg=cfg,
+    )
+
+

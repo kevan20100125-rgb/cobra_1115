@@ -16,6 +16,16 @@ are responsible for:
     - deciding which named modules to wrap,
     - selecting bitwidths / runtime flags,
     - and calling the factories provided here.
+
+Design note:
+    - For the current Cobra PTQ stack (including vision backbones), we only
+      need to wrap:
+          * nn.Linear
+          * nn.Conv1d / nn.Conv2d / nn.Conv3d
+      because all vision/LLM blocks are built from these.
+    - MatMul-style wrappers (`make_quant_matmul`) are kept for completeness
+      but deliberately not enabled by default here, to avoid guessing which
+      custom classes in your repo should be treated as matmul.
 """
 
 from dataclasses import dataclass
@@ -121,6 +131,12 @@ DEFAULT_WRAP_RULES: Sequence[WrapRule] = (
         factory=_conv_factory,
         allow_subclass=True,
     ),
+    # NOTE:
+    #   If, in the future, you introduce a dedicated MatMul module (e.g.
+    #   cobra.layers.MatMul or similar) and want to use QuantMatMul for it,
+    #   you can extend DEFAULT_WRAP_RULES here with an appropriate rule.
+    #   For now we keep make_quant_matmul imported but unused to avoid
+    #   making assumptions about your repository's custom modules.
 )
 
 
@@ -209,9 +225,12 @@ def wrap_module_with_rule(
     wrapped = rule.factory(module, params)
 
     overwatch.debug(
-        f"[WrapManifest] Wrapped {module.__class__.__name__} as {wrapped.__class__.__name__} "
-        f"(kind={rule.wrap_kind!r})",
+        "[WrapManifest] Wrapped %s as %s (kind=%r)",
+        module.__class__.__name__,
+        wrapped.__class__.__name__,
+        rule.wrap_kind,
         extra={"wrap_kind": rule.wrap_kind},
     )
 
     return wrapped
+

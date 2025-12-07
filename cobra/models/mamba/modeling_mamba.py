@@ -47,6 +47,8 @@ from transformers.utils import logging
 logger = logging.get_logger(__name__)
 from .configuration_mamba import MambaConfig
 
+from cobra.quantize.pct.collect import llm_tap_activation, get_global_llm_tap_context
+
 
 MAMBA_PRETRAINED_CONFIG_ARCHIVE_LIST = [
     "state-spaces/mamba-2.8b",
@@ -219,7 +221,13 @@ class GenerationMixin:
 
 class Block(nn.Module):
     def __init__(
-        self, dim, mixer_cls, norm_cls=nn.LayerNorm, fused_add_norm=False, residual_in_fp32=False
+        self,
+        dim,
+        mixer_cls,
+        norm_cls=nn.LayerNorm,
+        fused_add_norm=False,
+        residual_in_fp32=False,
+        layer_idx: Optional[int] = None,
     ):
         """
         Simple block wrapping a mixer class with LayerNorm/RMSNorm and residual connection"
@@ -238,11 +246,30 @@ class Block(nn.Module):
         self.fused_add_norm = fused_add_norm
         self.mixer = mixer_cls(dim)
         self.norm = norm_cls(dim)
+        self.layer_idx: Optional[int] = layer_idx
+
         if self.fused_add_norm:
             assert RMSNorm is not None, "RMSNorm import fails"
             assert isinstance(
                 self.norm, (nn.LayerNorm, RMSNorm)
             ), "Only LayerNorm and RMSNorm are supported for fused_add_norm"
+
+    def _llm_mixer_module_name(self) -> Optional[str]:
+        """
+        Canonical module path used for LLM activation collection.
+
+        NOTE:
+            This encodes the expected nesting inside Cobra's CobraVLM:
+                llm_backbone.llm.backbone.layers.{idx}.mixer
+
+            If this Mamba backbone is used in a different context, this path
+            may not correspond to an actual module name; in that case, the
+            tap data will still be collected, but calibrator/runtime are free
+            to ignore or remap these logical names.
+        """
+        if self.layer_idx is None:
+            return None
+        return f"llm_backbone.llm.backbone.layers.{self.layer_idx}.mixer"
 
     def forward(
         self, hidden_states: Tensor, residual: Optional[Tensor] = None, inference_params=None
@@ -269,7 +296,17 @@ class Block(nn.Module):
                 residual_in_fp32=self.residual_in_fp32,
                 eps=self.norm.eps,
             )
+
+        # Core Mamba mixer
         hidden_states = self.mixer(hidden_states, inference_params=inference_params)
+
+        # LLM activation tap: export mixer output to percentile pipeline (if enabled)
+        ctx = get_global_llm_tap_context()
+        if ctx is not None and ctx.enabled:
+            module_name = self._llm_mixer_module_name()
+            if module_name is not None:
+                llm_tap_activation("llm", module_name, hidden_states)
+
         return hidden_states, residual
 
     def allocate_inference_cache(self, batch_size, max_seqlen, dtype=None, **kwargs):
@@ -300,9 +337,12 @@ def create_block(
         norm_cls=norm_cls,
         fused_add_norm=fused_add_norm,
         residual_in_fp32=residual_in_fp32,
+        layer_idx=layer_idx,
     )
+    # Keep layer_idx attribute for any external logic that relies on it.
     block.layer_idx = layer_idx
     return block
+
 
 
 class MambaPreTrainedModel(PreTrainedModel):

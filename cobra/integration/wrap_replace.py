@@ -29,7 +29,7 @@ Typical usage (inside a CLI or training script):
     )
     from cobra.quantize.wrap.policy import WrapPolicyConfig
 
-    # 1) Float model → wrapped Quant* 模組
+    # 1) Float model → wrapped Quant* modules (fake-quant runtime)
     policy_cfg = WrapPolicyConfig(
         enable_vision_dino=True,
         enable_vision_siglip=True,
@@ -38,31 +38,24 @@ Typical usage (inside a CLI or training script):
     )
     wrap_registry = wrap_model_for_quantization(vlm, policy_cfg=policy_cfg)
 
-    # 2) 推論環境：從 int_export_W8A8.pt 還原量化狀態
+    # 2) (Optional, INT export path) Restore integer state from int_export_W8A8.pt
+    #    For the current fake-quant accuracy study, this step is typically unused.
     blob = torch.load("outputs/quantize/int_export_W8A8.pt", map_location="cpu")
     apply_int_quant_state(vlm, blob)
-
-    # `vlm` 會被就地替換成 Quant* 模組並安裝對應的
-    # integer weights / scales / zero-points / activation quantizers。
 """
 
 from __future__ import annotations
 
-from dataclasses import asdict
-from typing import Any, Dict, Iterable, Mapping, Optional, Sequence, Tuple
+from typing import Any, Dict, Mapping, Optional, Sequence
 
 import torch
 import torch.nn as nn
 
 from cobra.overwatch import initialize_overwatch
 
-from cobra.quantize.wrap.manifest import WrapRule, iter_default_wrap_rules
-from cobra.quantize.wrap.policy import (
-    DefaultWrapPolicy,
-    WrapPolicyConfig,
-    infer_target_from_module_path,
-)
-from cobra.quantize.wrap.registry import WrapEntry, WrapRegistry, build_wrap_registry
+from cobra.quantize.wrap.manifest import WrapRule
+from cobra.quantize.wrap.policy import WrapPolicyConfig
+from cobra.quantize.wrap.registry import WrapRegistry, build_wrap_registry
 from cobra.quantize.wrap.utils import (
     WrapQuantParams,
     get_module_by_path,
@@ -99,7 +92,7 @@ def apply_wrap_registry(
             WrapRegistry built via `build_wrap_registry(...)`.
         default_params:
             Optional WrapQuantParams controlling default quantizer kwargs.
-            If None, a fresh default instance is created for each wrap.
+            If None, a fresh default instance is used (shared across modules).
 
     Returns:
         The same `model` instance (mutated in-place), returned for convenience.
@@ -135,6 +128,19 @@ def apply_wrap_registry(
         params = default_params
         wrapped = entry.rule.factory(float_module, params)
 
+        overwatch.debug(
+            "[WrapReplace] Wrapping module=%r as %s (target=%r, kind=%r)",
+            module_path,
+            wrapped.__class__.__name__,
+            entry.target,
+            entry.rule_kind,
+            extra={
+                "module_path": module_path,
+                "wrap_target": entry.target,
+                "wrap_kind": entry.rule_kind,
+            },
+        )
+
         # Replace on parent
         replace_module_inplace(model, module_path, wrapped)
         replaced_count += 1
@@ -164,6 +170,10 @@ def wrap_model_for_quantization(
     High-level helper to:
         1) Build a WrapRegistry for `model` using a DefaultWrapPolicy.
         2) Apply that registry in-place to `model`.
+
+    This is the main entrypoint for MambaQuant-style fake-quant wrapping:
+    it replaces eligible float modules with Quant* modules that perform
+    quantize/dequant around standard PyTorch float kernels.
 
     Args:
         model:
@@ -270,7 +280,7 @@ def _tensor_like_ref(t: torch.Tensor, ref: torch.Tensor) -> torch.Tensor:
     Move tensor `t` to the same device as `ref`.
 
     We intentionally keep dtype of `t` (int weights / float scales),
-    only align device。
+    only align device.
     """
     if not isinstance(t, torch.Tensor):
         return t
@@ -312,6 +322,11 @@ def apply_int_quant_state(
               according to the export config.
             * Quant* modules carry integer weights + quantization metadata.
         - The same model instance is returned for convenience.
+
+    Note:
+        For the W4/W8 fake-quant accuracy study, this path is typically not
+        exercised; fake quant uses runtime quantize/dequant around float
+        kernels and reads activation clipping from the pct/calibration flow.
     """
     if not isinstance(export_blob, Mapping):
         raise TypeError(
@@ -352,11 +367,6 @@ def apply_int_quant_state(
     # ------------------------------------------------------------------
     # 1) Wrap float model according to export config
     # ------------------------------------------------------------------
-    # We rely on the same target vocabulary as IntExportConfig:
-    #   - include_vision_dino / include_vision_siglip / include_llm / include_projector
-    #
-    # wrap_model_for_quantization internally uses:
-    #   - build_wrap_registry + apply_wrap_registry
     wrap_model_for_quantization(
         model,
         policy_cfg=policy_cfg,
@@ -375,8 +385,8 @@ def apply_int_quant_state(
     skipped_weights = 0
 
     for full_name, w_record in weights_blob.items():
-        # export_int_quant_state 使用 key: "<module_path>.weight"
-        # 這裡我們拆出 module_path 與 param_name，以便找回對應 module。
+        # export_int_quant_state uses key: "<module_path>.weight"
+        # Here we split module_path and param_name to locate the module.
         if not isinstance(full_name, str) or "." not in full_name:
             overwatch.warning(
                 "[WrapReplace] Malformed weight key in export blob: %r",
@@ -387,7 +397,7 @@ def apply_int_quant_state(
 
         module_path, param_name = full_name.rsplit(".", 1)
         if param_name != "weight":
-            # 目前僅支援 ".weight"，其他 parameter 先直接略過。
+            # Currently only ".weight" is supported; skip others.
             overwatch.debug(
                 "[WrapReplace] Skipping non-weight parameter in export blob: %r",
                 full_name,
@@ -449,7 +459,7 @@ def apply_int_quant_state(
                 skipped_weights += 1
                 continue
 
-        # 取出 integer weight / scale / zero_point
+        # Extract integer weight / scale / zero_point
         int_weight = w_record.get("int_weight", None)
         scale = w_record.get("scale", None)
         zero_point = w_record.get("zero_point", None)
@@ -473,21 +483,19 @@ def apply_int_quant_state(
         if isinstance(zero_point, torch.Tensor):
             zero_point = _tensor_like_ref(zero_point, weight_ref)
 
-        # 安裝到 module 上：
-        # 1) 通用字段：weight_int / weight_scale / weight_zero_point
-        # 2) 若存在 weight_quantizer，則同步其 scale / round_zero_point
+        # Install on module:
+        # 1) Common attributes: weight_int / weight_scale / weight_zero_point
+        # 2) If a weight_quantizer exists, sync its scale / round_zero_point
         setattr(module, "weight_int", int_weight)
         setattr(module, "weight_scale", scale)
         setattr(module, "weight_zero_point", zero_point)
 
         w_q = getattr(module, "weight_quantizer", None)
-        # 僅在 quantizer 存在時才同步參數，避免 NoneType 問題
         if w_q is not None and isinstance(w_q, nn.Module):
             if isinstance(scale, torch.Tensor):
                 setattr(w_q, "scale", scale)
             if isinstance(zero_point, torch.Tensor):
                 setattr(w_q, "round_zero_point", zero_point)
-
 
         installed_weights += 1
 
@@ -535,7 +543,7 @@ def apply_int_quant_state(
 
         act_q = getattr(module, "act_quantizer", None)
         if act_q is None:
-            # 某些模組可能只有 weight quantizer，沒有 act_quantizer。
+            # Some modules may have only weight quantizer, no act_quantizer.
             overwatch.debug(
                 "[WrapReplace] Module %r has no 'act_quantizer'; "
                 "activation entry will be ignored.",
@@ -560,7 +568,6 @@ def apply_int_quant_state(
         scale = a_record.get("scale", None)
         zp = a_record.get("zero_point", None)
 
-        # act_quantizer 本身未必有參考 tensor，這裡直接沿用原本裝在 CPU 的 scale/zp。
         if isinstance(scale, torch.Tensor):
             setattr(act_q, "scale", scale)
         else:
@@ -574,7 +581,7 @@ def apply_int_quant_state(
         if isinstance(zp, torch.Tensor):
             setattr(act_q, "round_zero_point", zp)
         else:
-            # 允許 zero_point 為 None（symmetric quantization）
+            # Allow zero_point to be None (e.g., symmetric quantization).
             setattr(act_q, "round_zero_point", None)
 
         installed_acts += 1
@@ -605,3 +612,4 @@ def apply_int_quant_state(
     )
 
     return model
+
