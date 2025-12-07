@@ -1,4 +1,4 @@
-# cobra/quantize/finalize/int_export.py
+# cobra/quantize/finalize/int_export.py 
 
 """
 Integer export utilities for Cobra PTQ.
@@ -61,6 +61,11 @@ Typical usage (from switches/quant_finalize.py):
     cfg = IntExportConfig(weight_bits=4, act_bits=8, ...)
     export_blob = export_int_quant_state(vlm, cfg)
     save_int_export(export_blob, out_path="outputs/quantize/int_export_w4a8.pt")
+
+Phase 2 note:
+    - 新增 `int_export_config_from_quant_cfg(quant_cfg, ...)`，由
+      QuantRuntimeConfig 提供 weight_bits/act_bits + symmetric_*/targets，
+      讓 quant_finalize 不再手動組 IntExportConfig。
 """
 
 from __future__ import annotations
@@ -76,6 +81,7 @@ from cobra.overwatch import initialize_overwatch
 from cobra.quantize.pct.schema import compute_affine_params
 from cobra.quantize.wrap.policy import infer_target_from_module_path
 from cobra.quantize.quantizer import UniformAffineQuantizer
+from cobra.quantize.runtime.config import QuantRuntimeConfig  # Phase 2 helper import
 
 # We only need the types; logic is generic and checks attributes instead of
 # doing heavy isinstance chains. Importing them helps type-checkers & IDEs.
@@ -132,7 +138,7 @@ class IntExportConfig:
             )
 
         if self.weight_bits not in valid_bits:
-            raise ValueError(                
+            raise ValueError(
                 f"weight_bits must be one of {valid_bits}, got {self.weight_bits}"
             )
         if self.act_bits not in valid_bits:
@@ -156,6 +162,55 @@ class IntExportConfig:
         if target == "projector":
             return self.include_projector
         return False
+
+
+def int_export_config_from_quant_cfg(
+    quant_cfg: QuantRuntimeConfig,
+    *,
+    include_vision_dino: Optional[bool] = None,
+    include_vision_siglip: Optional[bool] = None,
+    include_llm: Optional[bool] = None,
+    include_projector: Optional[bool] = None,
+) -> IntExportConfig:
+    """
+    Helper: derive IntExportConfig from QuantRuntimeConfig.
+
+    Phase 2 goal:
+        - bits/backend/targets 的唯一來源是 QuantRuntimeConfig。
+        - int_export 僅負責把這些資訊轉成 IntExportConfig，避免 quant_finalize
+          再自己決定一次 include_* / bits。
+
+    Args:
+        quant_cfg:
+            QuantRuntimeConfig produced by `QuantRuntimeConfig.from_bits_backend`.
+        include_* (optional overrides):
+            若為 None，則預設「由 quant_cfg.use_pct_for 是否包含該 target」決定；
+            若不為 None，則以傳入值為準。
+
+    Returns:
+        IntExportConfig with:
+            - weight_bits / act_bits      ← quant_cfg.weight_bits / quant_cfg.act_bits
+            - signed_weights              ← quant_cfg.symmetric_weights
+            - signed_activations          ← quant_cfg.symmetric_acts
+            - include_*                   ← intersection(override, use_pct_for)
+    """
+    use_pct_for = set(quant_cfg.use_pct_for)
+
+    def _resolve_flag(name: str, override: Optional[bool]) -> bool:
+        if override is not None:
+            return override
+        return name in use_pct_for
+
+    return IntExportConfig(
+        weight_bits=quant_cfg.weight_bits,
+        act_bits=quant_cfg.act_bits,
+        signed_weights=quant_cfg.symmetric_weights,
+        signed_activations=quant_cfg.symmetric_acts,
+        include_vision_dino=_resolve_flag("vision.dino", include_vision_dino),
+        include_vision_siglip=_resolve_flag("vision.siglip", include_vision_siglip),
+        include_llm=_resolve_flag("llm", include_llm),
+        include_projector=_resolve_flag("projector", include_projector),
+    )
 
 
 # ============================================================================

@@ -26,6 +26,16 @@ Key concepts:
             - applies per-target enable flags
             - filters out clearly undesirable modules (e.g. LayerNorm)
             - filters by op kind (linear / conv)
+
+Design note:
+    The path → target heuristics here are intentionally aligned with:
+        - `cobra.switches.quant_calibrate._build_target_module_map`
+        - `cobra.quantize.runtime.load_quantized_vlm._classify_target_from_module_name`
+    so that:
+        - wrap registry coverage
+        - pct_stats / pct_hi_lo target fields
+        - runtime activation coverage
+    all speak the same four-way vocabulary.
 """
 
 from __future__ import annotations
@@ -41,6 +51,18 @@ from cobra.overwatch import initialize_overwatch
 from .manifest import WrapRule
 
 overwatch = initialize_overwatch(__name__)
+
+
+# ============================================================================
+# Canonical targets
+# ============================================================================
+
+_CANONICAL_TARGETS = (
+    "vision.dino",
+    "vision.siglip",
+    "llm",
+    "projector",
+)
 
 
 # ============================================================================
@@ -219,19 +241,63 @@ class DefaultWrapPolicy:
         # 1) Determine canonical target from path
         target = infer_target_from_module_path(module_path)
         if target is None:
+            # Only debug log for vision/LLM-like prefixes to avoid spam.
+            if module_path.startswith("vision_backbone") or module_path.startswith(
+                "llm_backbone"
+            ) or module_path.startswith("projector"):
+                overwatch.debug(
+                    "[WrapPolicy] No target inferred for module_path=%r (skipping)",
+                    module_path,
+                    extra={"wrap_module": module_path},
+                )
             return None
 
         # 2) Check per-target enable flags
         if not self.cfg.is_target_enabled(target):
+            overwatch.debug(
+                "[WrapPolicy] Target disabled by config: target=%r module=%r",
+                target,
+                module_path,
+                extra={"wrap_module": module_path, "wrap_target": target},
+            )
             return None
 
         # 3) Apply simple name-based and type-based exclusions
         if self._is_excluded_module(module_path, module):
+            overwatch.debug(
+                "[WrapPolicy] Module excluded by name/type: target=%r module=%r",
+                target,
+                module_path,
+                extra={"wrap_module": module_path, "wrap_target": target},
+            )
             return None
 
         # 4) Filter by op kind (linear / conv*)
         if not self._allow_op_kind(rule):
+            overwatch.debug(
+                "[WrapPolicy] Op kind excluded: target=%r module=%r kind=%r",
+                target,
+                module_path,
+                rule.wrap_kind,
+                extra={
+                    "wrap_module": module_path,
+                    "wrap_target": target,
+                    "wrap_kind": rule.wrap_kind,
+                },
+            )
             return None
+
+        overwatch.debug(
+            "[WrapPolicy] Will wrap module=%r as target=%r kind=%r",
+            module_path,
+            target,
+            rule.wrap_kind,
+            extra={
+                "wrap_module": module_path,
+                "wrap_target": target,
+                "wrap_kind": rule.wrap_kind,
+            },
+        )
 
         return target
 
@@ -247,8 +313,8 @@ def build_default_policy(cfg: Optional[WrapPolicyConfig] = None) -> DefaultWrapP
     """
     policy = DefaultWrapPolicy(cfg)
     overwatch.info(
-        "[WrapPolicy] Initialized DefaultWrapPolicy with config: "
-        f"{policy.cfg}",
+        "[WrapPolicy] Initialized DefaultWrapPolicy with config: %s",
+        policy.cfg,
     )
     return policy
 

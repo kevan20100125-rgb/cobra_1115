@@ -5,14 +5,29 @@ quant_pct_apply.py
 
 CLI entrypoint: "Percentile Apply Only"
 
-This script performs the **offline percentile-apply step**:
+Pipeline role (three-stage PTQ):
+    1) quant_calibrate.py
+         - Collect activation stats from running the model
+         - Save percentile stats (pct_stats_out)
+         - (Optionally) also produce hi/lo directly
+    2) quant_pct_apply.py  ← 本檔
+         - Pure offline step: stats → hi/lo (+ summary)
+         - Does not touch the model or dataloader
+         - Used when you want to re-run percentile decision logic with
+           different hyperparameters (e.g., tau, default_percentile, targets)
+    3) quant_finalize.py
+         - Load float checkpoint
+         - Wrap modules with Quant* kernels
+         - Apply hi/lo into activation quantizers
+         - Apply projector rotation and export integer weights/activations
 
+Responsibilities:
     1) Load previously collected activation percentile stats from disk
        (e.g., outputs/quantize/pct_stats.pt).
     2) Optionally compute a "best percentile" map using heuristic rules
        (growth ratios, robust scale, etc.) via `best_percentile.py`.
     3) Convert the chosen percentiles into per-hook hi/lo clipping bounds
-       via `pct.apply`.
+       via `pct.apply.build_hi_lo_map`.
     4) Save:
            - hi/lo map       -> pct_hi_lo.pt
            - human-readable  -> pct_apply_summary.json
@@ -20,12 +35,23 @@ This script performs the **offline percentile-apply step**:
 It does NOT:
     - Touch any model or run a dataloader.
     - Attach scales/zeros to quantizers (that is the calibrator's job).
+    - Decide bits/backend/runtime mode; that is owned by
+      QuantRuntimeConfig in `quant_calibrate.py`, `quant_finalize.py`,
+      and `quantize.runtime.load_quantized_vlm`.
+
+Design note for this variant:
+    - The default behavior is to include **all canonical targets**:
+          {"vision.dino", "vision.siglip", "llm", "projector"}.
+      In practice, if your stats file only contains LLM + projector (because
+      `quant_calibrate` did not enable vision), then only those targets will
+      appear in the resulting hi/lo map.
+      You can still explicitly restrict or extend the targets via CLI flags.
 """
 
 import json
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, Iterable, Mapping, MutableMapping, Optional, Sequence, Tuple
+from typing import Dict, Mapping, Optional, Sequence, Tuple, Any
 
 import draccus
 import torch
@@ -35,6 +61,7 @@ from cobra.quantize.pct.best_percentile import (
     get_best_percentile_map_with_traces,
 )
 from cobra.quantize.pct.apply import build_hi_lo_map
+from cobra.quantize.runtime.config import QuantRuntimeConfig
 
 overwatch = initialize_overwatch(__name__)
 
@@ -80,7 +107,9 @@ class PctApplyConfig:
     targets:
         Optional subset of canonical targets in
             {"vision.dino","vision.siglip","llm","projector"}.
-        If empty, all four are considered.
+        If empty, all four canonical targets are considered.
+        實務上會與 quant_calibrate.py / quant_finalize.py 中使用的 canonical
+        targets 保持一致，方便比較 coverage 與 histogram。
 
     Other
     -----
@@ -88,23 +117,72 @@ class PctApplyConfig:
         Whether to enforce symmetric clipping [-hi, +hi] when computing hi/lo.
         This is forwarded to `build_hi_lo_map`.
     """
-
     # fmt: off
+    # I/O
     pct_stats_in: Path = Path("outputs/quantize/pct_stats.pt")
     pct_hi_lo_out: Path = Path("outputs/quantize/pct_hi_lo.pt")
     pct_summary_out: Path = Path("outputs/quantize/pct_apply_summary.json")
 
+    # Best-percentile
     best_percentile: str = "apply"          # in {"off", "apply"}
     default_percentile: float = 99.9
 
-    targets: Tuple[str, ...] = field(default_factory=lambda: _CANONICAL_TARGETS)
-    symmetric: bool = True
+    # Quantization / backend
+    quant_bits: Optional[str] = None
+    backend: Optional[str] = "fake"
+
+    enable_vision_dino: bool = True
+    enable_vision_siglip: bool = True
+    enable_llm: bool = True
+    enable_projector: bool = True
+    vision_in_pct_pipeline: bool = True
+
+    # Targets override（若空則使用 QuantRuntimeConfig.use_pct_for）
+    targets: Tuple[str, ...] = field(default_factory=tuple)
+
+    # Symmetric clipping；None 則沿用 QuantRuntimeConfig.symmetric_acts
+    symmetric: Optional[bool] = None
     # fmt: on
 
-    def resolved_targets(self) -> Tuple[str, ...]:
+    def build_quant_cfg(self) -> QuantRuntimeConfig:
+        """
+        Construct a QuantRuntimeConfig from the bits/backend and target flags.
+
+        Note:
+        For offline percentile-apply, we mainly care about:
+            - use_pct_for      : 哪些 target 會被視為 percentile pipeline 的一部分
+            - symmetric_acts   : symmetric clipping 預設值
+        """
+        return QuantRuntimeConfig.from_bits_backend(
+            bits=self.quant_bits,
+            backend=self.backend,
+            enable_vision_dino=self.enable_vision_dino,
+            enable_vision_siglip=self.enable_vision_siglip,
+            enable_llm=self.enable_llm,
+            enable_projector=self.enable_projector,
+            vision_in_pct_pipeline=self.vision_in_pct_pipeline,
+        )
+
+    def resolved_targets(self, quant_cfg: QuantRuntimeConfig) -> Tuple[str, ...]:
+        """
+        Return the effective target set for this run.
+
+        Base set 來自 QuantRuntimeConfig.use_pct_for；若該集合為空（例如
+        backend="float"），則 fallback 成所有 canonical targets。
+        若 self.targets 非空，則視為在 base set 上做 intersection。
+        """
+        base: Tuple[str, ...]
+        if quant_cfg.use_pct_for:
+            base = tuple(sorted(quant_cfg.use_pct_for))
+        else:
+            base = _CANONICAL_TARGETS
+
         if not self.targets:
-            return _CANONICAL_TARGETS
-        return self.targets
+            return base
+
+        # intersect while preserving order in `base`
+        wanted = set(self.targets)
+        return tuple(t for t in base if t in wanted)
 
 
 # =============================================================================
@@ -151,7 +229,7 @@ def _summarize_hi_lo_map(
         hi = info.get("hi", None)
         lo = info.get("lo", None)
 
-        entry: Dict[str, float] = {}
+        entry: Dict[str, Any] = {}
         if tgt is not None:
             entry["target"] = str(tgt)
         if pct is not None:
@@ -179,6 +257,13 @@ def _save_json(obj: object, path: Path) -> None:
 
 @draccus.wrap()
 def quant_pct_apply(cfg: PctApplyConfig) -> None:
+    # ---------------------------------------------------------------------
+    # 0) Build QuantRuntimeConfig & resolve targets / symmetric flag
+    # ---------------------------------------------------------------------
+    quant_cfg = cfg.build_quant_cfg()
+    effective_targets = cfg.resolved_targets(quant_cfg)
+    symmetric = quant_cfg.symmetric_acts if cfg.symmetric is None else cfg.symmetric
+
     overwatch.info(
         "[quant_pct_apply] Starting percentile-apply phase",
         extra={
@@ -187,8 +272,11 @@ def quant_pct_apply(cfg: PctApplyConfig) -> None:
             "summary_out": str(cfg.pct_summary_out),
             "best_percentile": cfg.best_percentile,
             "default_percentile": cfg.default_percentile,
-            "targets": cfg.resolved_targets(),
-            "symmetric": cfg.symmetric,
+            "quant_bits": cfg.quant_bits,
+            "backend": cfg.backend,
+            "quant_use_pct_for": sorted(quant_cfg.use_pct_for),
+            "targets_effective": effective_targets,
+            "symmetric": symmetric,
         },
     )
 
@@ -204,9 +292,9 @@ def quant_pct_apply(cfg: PctApplyConfig) -> None:
     trace_map: Dict[str, Sequence[object]] = {}
 
     if cfg.best_percentile == "apply":
-        stages: Optional[Tuple[str, ...]] = cfg.resolved_targets()
+        stages: Optional[Tuple[str, ...]] = effective_targets
 
-        # New: use API that also returns per-target RuleTrace list
+        # Use API that also returns per-target RuleTrace list
         best_percent_map, trace_map = get_best_percentile_map_with_traces(
             stats=stats,
             include_targets=stages,
@@ -232,8 +320,8 @@ def quant_pct_apply(cfg: PctApplyConfig) -> None:
         stats=stats,
         best_percent_map=best_percent_map,
         default_percentile=cfg.default_percentile,
-        symmetric=cfg.symmetric,
-        targets=cfg.resolved_targets(),
+        symmetric=symmetric,
+        targets=effective_targets,
     )
 
     # Save hi/lo map as a torch blob
@@ -243,14 +331,18 @@ def quant_pct_apply(cfg: PctApplyConfig) -> None:
     # -------------------------------------------------------------------------
     # 4) Human-readable summary (含 best clipping 統計)
     # -------------------------------------------------------------------------
-    summary = {
+    summary: Dict[str, Any] = {
         "config": {
             "pct_stats_in": str(cfg.pct_stats_in),
             "pct_hi_lo_out": str(cfg.pct_hi_lo_out),
+            "pct_summary_out": str(cfg.pct_summary_out),
             "best_percentile": cfg.best_percentile,
             "default_percentile": cfg.default_percentile,
-            "targets": cfg.resolved_targets(),
-            "symmetric": cfg.symmetric,
+            "quant_bits": cfg.quant_bits,
+            "backend": cfg.backend,
+            "quant_use_pct_for": sorted(quant_cfg.use_pct_for),
+            "targets_effective": effective_targets,
+            "symmetric": symmetric,
         },
         "num_entries": len(hi_lo_map),
         "by_target": {},
@@ -259,7 +351,7 @@ def quant_pct_apply(cfg: PctApplyConfig) -> None:
 
     # 4A) Aggregate counts by target
     by_target: Dict[str, int] = {}
-    for hook, info in hi_lo_map.items():
+    for _, info in hi_lo_map.items():
         tgt = info.get("target", "unknown") if isinstance(info, Mapping) else "unknown"
         by_target[tgt] = by_target.get(tgt, 0) + 1
     summary["by_target"] = by_target

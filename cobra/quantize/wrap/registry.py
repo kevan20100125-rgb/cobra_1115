@@ -195,4 +195,3 @@ def build_wrap_registry(
         overwatch.info("[WrapRegistry] " + " | ".join(parts))
 
     return registry
-
