@@ -260,6 +260,57 @@ def _summarize_activation_quantizers(model: nn.Module, *, header: str) -> None:
         f"(coverage={global_ratio:6.3f})"
     )
 
+def _apply_runtime_weight_bits(vlm: nn.Module, quant_cfg: QuantRuntimeConfig) -> None:
+    """
+    Propagate QuantRuntimeConfig.weight_bits to all Quant* modules
+    (weights only).
+
+    This ensures that configurations like W2A2 / W4A4 / W8A8 truly differ
+    in their *weight* bit-width at runtime, instead of always using the
+    construction-time default (typically 8 bits).
+
+    Args:
+        vlm:
+            The already-wrapped Cobra VLM (after wrap_model_for_quantization).
+        quant_cfg:
+            QuantRuntimeConfig for the current run. Only effective when
+            quant_cfg.mode is QuantMode.FAKE.
+    """
+    if quant_cfg.mode is not QuantMode.FAKE:
+        # Only meaningful for FAKE runtime; FLOAT / INT_EXPORT are handled elsewhere.
+        print(
+            "[load_quantized_cobra_vlm] _apply_runtime_weight_bits called with "
+            f"mode={quant_cfg.mode.value}; skipping."
+        )
+        return
+
+    w_bits = quant_cfg.weight_bits
+    if w_bits is None:
+        print("[load_quantized_cobra_vlm] weight_bits is None; skipping weight bit propagation.")
+        return
+
+    # Local imports to avoid circular dependencies at module import time.
+    from cobra.quantize.int_linear import QuantLinear
+    from cobra.quantize.int_conv import QuantConv1d, QuantConv2d
+    from cobra.quantize.int_matmul import QuantMatMul
+
+    print(
+        "[load_quantized_cobra_vlm] Applying runtime weight_bits to Quant* modules "
+        f"(weight_bits={w_bits}) ..."
+    )
+
+    num_modules = 0
+    for module_name, module in vlm.named_modules():
+        if isinstance(module, (QuantLinear, QuantConv1d, QuantConv2d, QuantMatMul)):
+            # Only touch weight bits here; activation bits are driven by calibrator.
+            module.change_bits(weight_bits=w_bits, act_bits=None)
+            num_modules += 1
+
+    print(
+        "[load_quantized_cobra_vlm] Runtime weight_bits applied to "
+        f"{num_modules} Quant* modules (W{w_bits})."
+    )
+
 def _enable_model_fake_quant(vlm: nn.Module, quant_cfg: QuantRuntimeConfig) -> None:
     """
     Enable MambaQuant-style fake quantization on the wrapped Cobra VLM.
@@ -438,6 +489,9 @@ def load_quantized_cobra_vlm(
         prefix="",
     )
 
+    # ★ 新增這一行：把 QuantRuntimeConfig.weight_bits 套進所有 Quant* modules
+    _apply_runtime_weight_bits(vlm, quant_cfg=quant_cfg)
+    
     # Optional: diagnostic before calibration (should be 0% coverage)
     _summarize_activation_quantizers(vlm, header="BEFORE calibration")
 

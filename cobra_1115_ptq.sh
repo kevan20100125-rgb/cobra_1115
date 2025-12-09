@@ -44,11 +44,11 @@ mkdir -p outputs/quantize outputs/slurm
 #   calibrate  -> 只跑 quant_calibrate（產生 pct_stats_*, pct_hi_lo_*）
 #   finalize   -> 只跑 quant_finalize（產生 int_export_*）
 #   full       -> 先 calibrate 再 finalize
-MODE="${MODE:-full}"
+MODE="${MODE:-calibrate}"
 
 # BITS: W{2,4,8,16}A{2,4,8,16}，例如 W8A8 / W4A4
 #   目前 fake quant accuracy study 主力會用 W8A8 / W4A4
-BITS="${BITS:-W2A2}"
+BITS="${BITS:-W16A16}"
 
 # SMOKE:
 #   0 -> 正式校正（使用 QuantCalibrateConfig 的預設為主）
@@ -165,6 +165,11 @@ base_cfg_kwargs = dict(
     pct_summary_out=pct_summary_out,
     dataset=calib_dataset_cfg,
     stage="align",
+    enable_vision_dino=True,
+    enable_vision_siglip=True,
+    enable_llm=True,
+    enable_projector=True,
+    vision_in_pct_pipeline=True,
 )
 
 if SMOKE == 1:
