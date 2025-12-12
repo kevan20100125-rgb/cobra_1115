@@ -130,11 +130,11 @@ class TextVQA_100_Calib_Config(DatasetConfig):
     dataset_id: str = "calib-textvqa-100"
 
     align_stage_components: Tuple[Path, Path] = (
-        Path("data/calibration/train_images_100_llava.json"),
+        Path("/work/asdf1234/samples/textvqa/train_images_100.json"),
         Path("/work/asdf1234/samples/textvqa/train_images_100"),
     )
     finetune_stage_components: Tuple[Path, Path] = (
-        Path("data/calibration/train_images_100_llava.json"),
+        Path("/work/asdf1234/samples/textvqa/train_images_100.json"),
         Path("/work/asdf1234/samples/textvqa/train_images_100"),
     )
     dataset_root_dir: Path = Path(".")
