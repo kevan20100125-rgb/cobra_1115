@@ -6,8 +6,6 @@ Unified entrypoint for reconstructing a *fake-quantized* Cobra VLM from:
     • float checkpoint (loaded by cobra.load)
     • pct_hi_lo  (activation clipping ranges, produced by quant_calibrate.py
                   or quant_pct_apply.py)
-    • (optionally) int_export (offline integer export blob; currently not
-      used in the PyTorch runtime path)
 
 This file is used ONLY at inference time (eval), not for calibration.
 
@@ -26,7 +24,7 @@ Notes (Phase 1, runtime unification):
     - Quantization設定（bits/backend/哪些 target 進 percentile pipeline）交給
       `QuantRuntimeConfig.from_bits_backend` 處理：
         * bits    -> (weight_bits, act_bits)
-        * backend -> mode ∈ {FLOAT, FAKE, INT_EXPORT}
+        * backend -> mode ∈ {FLOAT, FAKE}
         * enable_* / vision_in_pct_pipeline -> use_pct_for（哪些 target 會被校正）
     - 本檔只處理「推論時的 fake quant 重建」：
         * bits/backend/targets 的解析：QuantRuntimeConfig
@@ -41,7 +39,7 @@ Notes (Phase 2, config single-source):
 Notes (Phase 2+, projector rotation):
     - 是否允許 projector rotation 由 QuantRuntimeConfig.use_rotation_for /
       QuantRuntimeConfig.should_rotate_projector() 決定，確保：
-        * finalize (INT export) 與 runtime (fake / 未來 INT) 使用同一 gating 策略。
+        * runtime (fake / 未來 INT) 使用同一 gating 策略。
     - projector rotation 模式（"hk" / "hadamard" / "none"）由
       QuantRuntimeConfig.projector_rotation_mode 管理；來源可以是：
         * CLI（quant_finalize）或
@@ -146,41 +144,6 @@ def _load_hi_lo_map(pct_hi_lo_path: Path) -> dict:
         )
     return hi_lo_map
 
-
-def _maybe_check_int_export(int_export_path: Path) -> None:
-    """
-    Best-effort sanity check that an int_export blob exists.
-
-    Current runtime path does not consume the blob, but we verify existence and
-    basic loadability so that a broken export is caught early.
-
-    TODO (Phase 3):
-        - When INT_EXPORT runtime is wired, this check should move next to
-          the actual apply-int-state path, and errors should be treated as fatal.
-    """
-    int_export_path = Path(int_export_path)
-    if not int_export_path:
-        return
-    if not int_export_path.exists():
-        print(
-            f"[load_quantized_cobra_vlm] WARNING: int_export_path={int_export_path} does not exist; "
-            f"runtime will proceed without using integer export."
-        )
-        return
-
-    try:
-        _ = torch.load(int_export_path, map_location="cpu")
-        print(
-            f"[load_quantized_cobra_vlm] Found int_export blob at {int_export_path} "
-            f"(not used at runtime)."
-        )
-    except Exception as e:  # noqa: BLE001
-        print(
-            f"[load_quantized_cobra_vlm] WARNING: Failed to load int_export blob at "
-            f"{int_export_path}: {e}"
-        )
-
-
 def _classify_target_from_module_name(module_name: str) -> str:
     """
     Heuristic mapping from module qualified name to canonical target.
@@ -277,7 +240,7 @@ def _apply_runtime_weight_bits(vlm: nn.Module, quant_cfg: QuantRuntimeConfig) ->
             quant_cfg.mode is QuantMode.FAKE.
     """
     if quant_cfg.mode is not QuantMode.FAKE:
-        # Only meaningful for FAKE runtime; FLOAT / INT_EXPORT are handled elsewhere.
+        # Only meaningful for FAKE runtime; FLOAT is handled elsewhere.
         print(
             "[load_quantized_cobra_vlm] _apply_runtime_weight_bits called with "
             f"mode={quant_cfg.mode.value}; skipping."
@@ -359,7 +322,6 @@ def load_quantized_cobra_vlm(
     *,
     bits: str,
     pct_hi_lo_path: Path,
-    int_export_path: Path,
     hf_token: Optional[str],
     base_dtype: torch.dtype,
     device: torch.device,
@@ -379,9 +341,6 @@ def load_quantized_cobra_vlm(
         pct_hi_lo_path:
             Path to the hi/lo clipping map produced by `quant_calibrate.py`
             or `quant_pct_apply.py`.
-        int_export_path:
-            Path to the integer export blob produced by `quant_finalize.py`.
-            Currently only checked for existence; not consumed in this runtime.
         hf_token:
             HF token passed to `cobra.load()`.
         base_dtype:
@@ -447,17 +406,9 @@ def load_quantized_cobra_vlm(
     # 2. Select path by QuantMode
     # ------------------------------------------------------------------
     if quant_cfg.mode is QuantMode.FLOAT:
-        # Pure float: no wrap, no calibration, no pct/int_export consumed.
+        # Pure float: no wrap, no calibration, no pct consumed.
         print("[load_quantized_cobra_vlm] QuantMode=FLOAT; returning float Cobra without wrapping.")
         return vlm
-
-    if quant_cfg.mode is QuantMode.INT_EXPORT:
-        # Future: wrap + apply_int_state(blob, quant_cfg).
-        # For now we fail loudly to avoid silent misconfiguration.
-        raise NotImplementedError(
-            "[load_quantized_cobra_vlm] INT_EXPORT mode not yet wired; "
-            "please use BACKEND=fake for now."
-        )
 
     # From here on we are in FAKE mode (current main path).
     assert quant_cfg.mode is QuantMode.FAKE
@@ -574,14 +525,5 @@ def load_quantized_cobra_vlm(
             f"projector_rotation_mode={rotation_mode})"
         )
 
-    # ------------------------------------------------------------------
-    # 7. (Optional) Sanity-check integer export blob
-    # ------------------------------------------------------------------
-    _maybe_check_int_export(int_export_path)
-
-    print(
-        "[load_quantized_cobra_vlm] Quantized Cobra ready "
-        "(wrapped + calibrated + fake-quant enabled + rotated)."
-    )
     return vlm
 

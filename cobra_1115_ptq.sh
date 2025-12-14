@@ -17,121 +17,125 @@ set -euo pipefail
 # ==============================
 module load cuda/12.4
 
-export ADDR2LINE=${ADDR2LINE:-$(command -v addr2line || true)}
-export TOKENIZERS_PARALLELISM=false
-export OMP_NUM_THREADS="${SLURM_CPUS_PER_TASK:-6}"
-
+# conda activate under nounset-safe wrapper
 set +u
 source /work/asdf1234/miniconda3/etc/profile.d/conda.sh
 conda activate cobra
 set -u
 
-export DATASETS_DIR=${DATASETS_DIR:-/work/asdf1234/samples}
-export HF_HOME=${HF_HOME:-/work/asdf1234/.cache/huggingface}
+# ==============================
+# 2. 專案位址 / PYTHONPATH
+# ==============================
+# 預設以當前工作目錄為 cobra_1115 根目錄；可由外部覆寫
+export COBRA_1115_ROOT="${COBRA_1115_ROOT:-$(pwd)}"
+cd "${COBRA_1115_ROOT}"
+
+export PYTHONPATH="${COBRA_1115_ROOT}:${PYTHONPATH:-}"
+
+# Cache 位置（可視環境調整）
+export HF_HOME="${HF_HOME:-${HOME}/.cache/huggingface}"
+export TRANSFORMERS_CACHE="${TRANSFORMERS_CACHE:-${HF_HOME}}"
+export HF_DATASETS_CACHE="${HF_DATASETS_CACHE:-${HF_HOME}}"
 
 # ==============================
-# 2. 專案位置
-# ==============================
-PROJECT_ROOT="/work/asdf1234/cobra_1115"
-cd "${PROJECT_ROOT}"
-
-mkdir -p outputs/quantize outputs/slurm
-
-# ==============================
-# 3. 控制參數：MODE / BITS / SMOKE / ROTATION_MODE
+# 3. 入口參數（只保留 klt / calibrate）
 # ==============================
 # MODE:
-#   calibrate  -> 只跑 quant_calibrate（產生 pct_stats_*, pct_hi_lo_*）
-#   finalize   -> 只跑 quant_finalize（產生 int_export_*）
-#   full       -> 先 calibrate 再 finalize
-MODE="${MODE:-calibrate}"
+#   klt       -> 只跑 quant_klt（產生 shared_klt.pt）
+#   calibrate -> 只跑 quant_calibrate（產生 pct_stats / pct_hi_lo / summary）
+#   full      -> calibrate + klt
+MODE="${MODE:-full}"
 
-# BITS: W{2,4,8,16}A{2,4,8,16}，例如 W8A8 / W4A4
-#   目前 fake quant accuracy study 主力會用 W8A8 / W4A4
-BITS="${BITS:-W16A16}"
+# BITS: 例如 W8A8 / W4A4 / W16A16（quant_calibrate 用）
+BITS="${BITS:-W4A4}"
 
 # SMOKE:
+#   1 -> smoke test（極少 batch 驗證流程）
 #   0 -> 正式校正（使用 QuantCalibrateConfig 的預設為主）
-#   1 -> smoke test，只跑極少 batch 做流程驗證
 SMOKE="${SMOKE:-1}"
 
-# ROTATION_MODE:
-#   hk       -> KLT + Hadamard
-#   hadamard -> 只有 Hadamard
-#   none     -> 完全不旋轉
-ROTATION_MODE="${ROTATION_MODE:-hk}"
-
-# 基本合法值檢查；不合法時 fallback 為 hk
-case "${ROTATION_MODE}" in
-  hk|hadamard|none)
-    ;;
+# quant_calibrate 的 backend：你目前 repo 只保留 float/fake runtime；校正應走 fake
+BACKEND="${BACKEND:-fake}"
+case "${BACKEND}" in
+  fake) ;;
   *)
-    echo "[WARN] Unknown ROTATION_MODE='${ROTATION_MODE}', falling back to 'hk'." >&2
-    ROTATION_MODE="hk"
+    echo "[ERROR] BACKEND must be 'fake' for quant_calibrate. Got: ${BACKEND}"
+    exit 1
     ;;
 esac
 
-# 使用正規表示式解析 WxxAyy
-if [[ "$BITS" =~ ^W([0-9]+)A([0-9]+)$ ]]; then
-  W_BITS="${BASH_REMATCH[1]}"
-  A_BITS="${BASH_REMATCH[2]}"
-else
-  echo "[ERROR] Invalid BITS format '$BITS'. Expected W{num}A{num}." >&2
-  exit 1
-fi
+# quant_klt stage（QuantKLTConfig 預設 finetune；可覆寫）
+STAGE="${STAGE:-finetune}"
 
-VALID_BITS=("2" "4" "8" "16")
+# HF token（quant_klt 會用到；QuantKLTConfig 預設 .hf_token）
+HF_TOKEN_PATH="${HF_TOKEN_PATH:-${COBRA_1115_ROOT}/.hf_token}"
 
-# 拒絕 1-bit
-if [[ "$W_BITS" == "1" ]] || [[ "$A_BITS" == "1" ]]; then
-  echo "[ERROR] 1-bit quantization is NOT supported. Got BITS='${BITS}'." >&2
-  exit 1
-fi
-
-# --- 檢查 weight_bits ---
-is_valid=false
-for b in "${VALID_BITS[@]}"; do
-  if [[ "$W_BITS" == "$b" ]]; then
-    is_valid=true
-    break
-  fi
-done
-if [[ "$is_valid" != true ]]; then
-  echo "[ERROR] weight_bits=$W_BITS not in {2,4,8,16}" >&2
-  exit 1
-fi
-
-# --- 檢查 act_bits ---
-is_valid=false
-for b in "${VALID_BITS[@]}"; do
-  if [[ "$A_BITS" == "$b" ]]; then
-    is_valid=true
-    break
-  fi
-done
-if [[ "$is_valid" != true ]]; then
-  echo "[ERROR] act_bits=$A_BITS not in {2,4,8,16}" >&2
-  exit 1
-fi
-
-echo "[INFO] MODE=${MODE}, BITS=${BITS}  (W_BITS=${W_BITS}, A_BITS=${A_BITS}, SMOKE=${SMOKE}, ROTATION_MODE=${ROTATION_MODE})"
-
-# 依 bit 組合分檔（fake quant / int_export 都共用這套命名）
-PCT_STATS="outputs/quantize/pct_stats_${BITS}.pt"
-PCT_HI_LO="outputs/quantize/pct_hi_lo_${BITS}.pt"
-PCT_SUMMARY="outputs/quantize/pct_calibrate_summary_${BITS}.json"
-INT_EXPORT="outputs/quantize/int_export_${BITS}.pt"
-
-export BITS
-export PCT_STATS PCT_HI_LO PCT_SUMMARY INT_EXPORT SMOKE
-# 讓後續 Python / runtime 都看到 ROTATION_MODE，並且把它同步到
-# load_quantized_vlm.py 用的 COBRA_PROJECTOR_ROTATION_MODE。
-export ROTATION_MODE
-export COBRA_PROJECTOR_ROTATION_MODE="${ROTATION_MODE}"
-
+mkdir -p outputs/slurm outputs/quantize
 
 # ==============================
-# 4. Calibration（quant_calibrate）
+# 4. 輸出路徑（僅保留 pct 與 klt）
+# ==============================
+PCT_STATS="${PCT_STATS:-outputs/quantize/pct_stats_${BITS}.pt}"
+PCT_HI_LO="${PCT_HI_LO:-outputs/quantize/pct_hi_lo_${BITS}.pt}"
+PCT_SUMMARY="${PCT_SUMMARY:-outputs/quantize/pct_calibrate_summary_${BITS}.json}"
+
+# shared KLT（QuantKLTConfig 預設是 cobra.quantize.rotate.projector.SHARED_KLT_PATH）
+# 這裡提供可覆寫的統一出口，避免硬編碼絕對路徑卡住不同機器
+KLT_OUT="${KLT_OUT:-outputs/quantize/shared_klt.pt}"
+# ==============================
+export MODE
+export BITS
+export SMOKE
+export BACKEND
+export STAGE
+export HF_TOKEN_PATH
+export PCT_STATS
+export PCT_HI_LO
+export PCT_SUMMARY
+export KLT_OUT
+# ==============================
+echo "[INFO] COBRA_1115_ROOT=${COBRA_1115_ROOT}"
+echo "[INFO] MODE=${MODE}, BITS=${BITS}, BACKEND=${BACKEND}, SMOKE=${SMOKE}, STAGE=${STAGE}"
+echo "[INFO] PCT_STATS=${PCT_STATS}"
+echo "[INFO] PCT_HI_LO=${PCT_HI_LO}"
+echo "[INFO] PCT_SUMMARY=${PCT_SUMMARY}"
+echo "[INFO] KLT_OUT=${KLT_OUT}"
+echo "[INFO] HF_TOKEN_PATH=${HF_TOKEN_PATH}"
+
+# ==============================
+# 5. KLT（quant_klt）
+# ==============================
+if [[ "${MODE}" == "klt" || "${MODE}" == "full" ]]; then
+  echo "[STEP] Running cobra_1115 quant_klt ..."
+
+  python - << 'PY'
+import os
+from pathlib import Path
+
+from cobra.switches.quant_klt import QuantKLTConfig, quant_klt
+
+STAGE = os.environ.get("STAGE", "finetune")
+HF_TOKEN_PATH = Path(os.environ.get("HF_TOKEN_PATH", ".hf_token"))
+KLT_OUT = Path(os.environ.get("KLT_OUT", "outputs/quantize/shared_klt.pt"))
+
+cfg = QuantKLTConfig(
+    stage=STAGE,
+    hf_token=HF_TOKEN_PATH,
+    klt_out=KLT_OUT,
+)
+
+print(
+    f"[QuantKLT] Running with stage={cfg.stage}, device={cfg.device}, "
+    f"klt_out={cfg.klt_out}, hf_token={cfg.hf_token}"
+)
+quant_klt(cfg)
+PY
+
+  echo "[STEP] KLT finished. Saved -> ${KLT_OUT}"
+fi
+
+# ==============================
+# 6. Calibration（quant_calibrate）
 # ==============================
 if [[ "${MODE}" == "calibrate" || "${MODE}" == "full" ]]; then
   echo "[STEP] Running cobra_1115 quant_calibrate ..."
@@ -144,36 +148,29 @@ from cobra.switches.quant_calibrate import QuantCalibrateConfig, quant_calibrate
 from cobra.conf.datasets import DatasetConfig, DatasetRegistry
 
 BITS = os.environ.get("BITS", "W8A8")
+BACKEND = os.environ.get("BACKEND", "fake")
 SMOKE = int(os.environ.get("SMOKE", "0"))
 
 pct_stats_out = Path(os.environ["PCT_STATS"])
 pct_hi_lo_out = Path(os.environ["PCT_HI_LO"])
 pct_summary_out = Path(os.environ["PCT_SUMMARY"])
 
-# 使用 TEXTVQA_100_CALIB 作為預設 calibration dataset
+# 預設 calibration dataset：TEXTVQA_100_CALIB
 calib_cfg_cls = DatasetConfig.get_choice_class(
     DatasetRegistry.TEXTVQA_100_CALIB.dataset_id
 )
 calib_dataset_cfg = calib_cfg_cls()
 
-# 基本設定：bit / dataset / 輸出路徑
 base_cfg_kwargs = dict(
     quant_bits=BITS,
-    backend="fake",
+    backend=BACKEND,
+    dataset=calib_dataset_cfg,
     pct_stats_out=pct_stats_out,
     pct_hi_lo_out=pct_hi_lo_out,
     pct_summary_out=pct_summary_out,
-    dataset=calib_dataset_cfg,
-    stage="align",
-    enable_vision_dino=True,
-    enable_vision_siglip=True,
-    enable_llm=True,
-    enable_projector=True,
-    vision_in_pct_pipeline=True,
 )
 
 if SMOKE == 1:
-    # 極小預算：只驗證 pipeline 是否能跑通
     cfg = QuantCalibrateConfig(
         **base_cfg_kwargs,
         per_device_batch_size=2,
@@ -182,77 +179,20 @@ if SMOKE == 1:
         max_samples_per_module=200_000,
     )
 else:
-    # 正式校正：採用 QuantCalibrateConfig 預設為主（可視需要再微調）
     cfg = QuantCalibrateConfig(
         **base_cfg_kwargs,
-        # 你可以視需要在這裡覆寫 per_device_batch_size / num_workers / max_calib_batches
-        # 不寫就用 QuantCalibrateConfig 的 defaults：
-        # per_device_batch_size=8, num_workers=4, max_calib_batches=0 ...
+        # 正式校正：其餘超參數用 QuantCalibrateConfig 預設
     )
 
 print(
-    f"[QuantCalibrate] Running with quant_bits={cfg.quant_bits}, "
-    f"resolved act_bits={cfg.act_bits}, smoke={SMOKE}"
+    f"[QuantCalibrate] Running with quant_bits={cfg.quant_bits}, backend={cfg.backend}, "
+    f"resolved act_bits={cfg.act_bits}, smoke={SMOKE}, "
+    f"pct_stats_out={cfg.pct_stats_out}, pct_hi_lo_out={cfg.pct_hi_lo_out}"
 )
 quant_calibrate(cfg)
 PY
 
   echo "[STEP] Calibration finished."
-  echo "       stats   -> ${PCT_STATS}"
-  echo "       hi/lo   -> ${PCT_HI_LO}"
-  echo "       summary -> ${PCT_SUMMARY}"
 fi
 
-# ==============================
-# 5. Finalize（quant_finalize，預留未來 INT 用）
-# ==============================
-if [[ "${MODE}" == "finalize" || "${MODE}" == "full" ]]; then
-  echo "[STEP] Running cobra_1115 quant_finalize ..."
-
-  python - << 'PY'
-import os
-from pathlib import Path
-
-from cobra.switches.quant_finalize import QuantFinalizeConfig, run_quant_finalize
-
-ROTATION_MODE = os.environ.get("ROTATION_MODE", "hk")
-
-pct_hi_lo_in = Path(os.environ["PCT_HI_LO"])
-out_path = Path(os.environ["INT_EXPORT"])
-
-cfg = QuantFinalizeConfig(
-    pct_hi_lo_in=pct_hi_lo_in,
-    quant_bits=BITS,
-    backend="int",
-    signed_weights=True,
-    signed_activations=True,
-    include_vision_dino=True,
-    include_vision_siglip=True,
-    include_llm=True,
-    include_projector=True,
-    # projector rotation 設定：
-    #   - 高階模式由 QuantRuntimeConfig 解析 ROTATION_MODE（hk/hadamard/none）
-    #   - 細部旗標預設全開，交由 QuantRuntimeConfig 決定實際是否使用 KLT/Hadamard
-    projector_rotation_mode=ROTATION_MODE,
-    use_klt=True,
-    use_hadamard=True,
-    shared_klt=True,
-    out_path=out_path,
-    device="cuda",
-)
-
-print(
-    f"[QuantFinalize] Running with quant_bits={cfg.quant_bits} "
-    f"(resolved W_BITS={cfg.weight_bits}, A_BITS={cfg.act_bits}), "
-    f"projector_rotation_mode={ROTATION_MODE}"
-)
-run_quant_finalize(cfg)
-PY
-
-  echo "[STEP] Finalize finished. Integer export -> ${INT_EXPORT}"
-fi
-
-echo "[DONE] cobra_1115 PTQ pipeline complete (MODE=${MODE}, BITS=${BITS}, SMOKE=${SMOKE})."
-
-
-
+echo "[DONE] cobra_1115 PTQ script complete (MODE=${MODE}, BITS=${BITS}, SMOKE=${SMOKE})."

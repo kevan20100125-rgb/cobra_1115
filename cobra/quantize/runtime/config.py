@@ -36,7 +36,6 @@ _SUPPORTED_BITS = (2, 4, 8, 16)
 class QuantMode(Enum):
     FLOAT = "float"         # 完全不量化（baseline）
     FAKE = "fake"           # fake quant（MambaQuant-style，仍用 float kernel）
-    INT_EXPORT = "int_export"  # 已套用 int_export blob 的 int 權重路徑
 
 
 @unique
@@ -67,7 +66,7 @@ class QuantRuntimeConfig:
     bits: Optional[str]                      # 原始字串："W4A4" / "W8A8" / None (表示 float)
     weight_bits: int                         # 內部解析後的 W bits
     act_bits: int                            # 內部解析後的 A bits
-    mode: QuantMode                          # FLOAT / FAKE / INT_EXPORT
+    mode: QuantMode                          # FLOAT / FAKE
 
     # 哪些 target 進 percentile / quant 流程
     use_pct_for: Set[str] = field(default_factory=set)
@@ -193,7 +192,6 @@ class QuantRuntimeConfig:
         backend:
             - None / "float" -> FLOAT 模式（不 wrap / 不 pct / 不 finalize）
             - "fake"         -> FAKE 模式（wrap + pct calibrate）
-            - "int"          -> INT_EXPORT 模式（wrap + apply int_export blob）
 
         bits:
             - None 代表 float baseline
@@ -206,10 +204,10 @@ class QuantRuntimeConfig:
             若為 None，預設為 "hk"。
         """
         backend_norm = (backend or "float").lower()
-        if backend_norm not in ("float", "fake", "int"):
+        if backend_norm not in ("float", "fake"):
             raise ValueError(
                 f"[QuantRuntimeConfig] Unsupported backend={backend!r}; "
-                f"expected 'float', 'fake', or 'int'."
+                f"expected 'float', 'fake'."
             )
 
         w_bits, a_bits = cls._parse_bits(bits)
@@ -219,8 +217,6 @@ class QuantRuntimeConfig:
             mode = QuantMode.FLOAT
         elif backend_norm == "fake":
             mode = QuantMode.FAKE
-        else:
-            mode = QuantMode.INT_EXPORT
 
         # 哪些 target 要進 percentile / quant 流程
         use_pct_for: Set[str] = set()
