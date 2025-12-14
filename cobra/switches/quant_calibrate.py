@@ -6,21 +6,11 @@ quant_calibrate.py
 CLI entrypoint for percentile-based activation calibration.
 
 Pipeline role (three-stage PTQ):
-    1) quant_calibrate.py
+    quant_calibrate.py
          - Run model + dataloader once
          - Collect activation statistics and build percentile stats
          - (Convenience mode) Optionally convert stats → hi/lo directly
            and write pct_hi_lo_out + pct_summary_out
-    2) quant_pct_apply.py
-         - Pure offline step: pct_stats_in → hi/lo (+ summary)
-         - Used when you want to re-run percentile decision logic without
-           touching the model / dataloader
-    3) quant_finalize.py
-         - Load float checkpoint
-         - Wrap modules with Quant* kernels
-         - Apply hi/lo into activation quantizers
-         - Apply projector rotation (R = H K)
-         - Export integer weights + activation quant metadata
 
 Responsibilities of this script:
     - Initialize a Cobra VLM and its pretraining dataset (align / finetune)
@@ -32,29 +22,16 @@ Responsibilities of this script:
           stats -> best-percentile map (internal) -> (hi, lo)
       and save the resulting hi/lo clipping map + JSON summary to disk.
 
-This script does NOT:
-    - Perform weight quantization or integer kernel export (handled by
-      `quantize/finalize/int_export.py` via quant_finalize.py).
-    - Perform module wrapping for runtime inference (handled by
-      `quantize.wrap` and `quantize.runtime.load_quantized_vlm`).
-    - Handle distributed training (FSDP / DDP); it is intended for
-      single-process calibration only.
-
 Design notes in this variant:
     - Quantization-related knobs（bits/backend/哪些 target 進 percentile pipeline）
       由 QuantRuntimeConfig 統一管理：
           * quant_bits + backend -> (weight_bits, act_bits, mode, use_pct_for...)
-      這樣 quant_calibrate / quant_finalize / load_quantized_vlm 共享同一套
+      這樣 quant_calibrate / load_quantized_vlm 共享同一套
       bits/backend/targets 決策邏輯。
     - Vision backbones (DINO / SigLIP) participation in percentile pipeline
       仍由 enable_vision_* + vision_in_pct_pipeline 控制，但實際啟用與否
       會反映在 QuantRuntimeConfig.use_pct_for。
-    - 實際使用上可以區分兩種模式：
-        * Minimal mode:
-            - 只關心 pct_stats_out，當作 quant_pct_apply.py 的輸入
-        * Convenience mode:
-            - 同時產出 pct_hi_lo_out + pct_summary_out，
-              可直接給 quant_finalize.py / load_quantized_vlm 使用
+    - Convenience mode:同時產出 pct_hi_lo_out + pct_summary_out，可直接給 load_quantized_vlm 使用
 """
 
 import json
@@ -105,48 +82,6 @@ overwatch = initialize_overwatch(__name__)
 
 @dataclass
 class QuantCalibrateConfig:
-    """
-    Configuration for percentile-based activation calibration.
-
-    Note:
-    This CLI is now **collect-only**:
-    it builds activation percentile stats and hi/lo clipping bounds,
-    but does not modify the model in-place. Downstream scripts
-    (`quant_pct_apply.py`, `quant_finalize.py`, `cobra.quantize.pct.calibrator`)
-    are responsible for actually applying these parameters to wrapped modules
-    or re-running percentile selection offline.
-
-    Key knobs (旗標):
-        - model / dataset / stage:
-            which pretrained Cobra VLM + dataset split to use.
-        - quant_bits / backend:
-            交給 QuantRuntimeConfig 解析成 weight_bits / act_bits
-            與 use_pct_for / use_rotation_for 等欄位。
-        - tau_growth:
-            growth-ratio threshold for best-percentile selection.
-        - symmetric_clipping:
-            whether to enforce symmetric hi/lo around 0.
-        - enable_*:
-            哪些 canonical targets 允許進 percentile pipeline（會傳給
-            QuantRuntimeConfig.from_bits_backend）。
-        - max_calib_batches:
-            limit how much data to stream.
-        - max_samples_per_module:
-            cap how many activation samples each collector stores.
-        - pct_*_out:
-            output paths for stats / hi-lo map / calibration summary.
-
-    Usage patterns:
-        - Minimal:
-            * run quant_calibrate.py
-            * only consume pct_stats_out as input to quant_pct_apply.py
-        - Convenience:
-            * rely on the internal build_hi_lo_map call to directly
-              produce pct_hi_lo_out + pct_summary_out, then pass
-              pct_hi_lo_out to quant_finalize.py / load_quantized_vlm.py
-    """
-
-
     # === Model / Dataset Selection ===
 
     # ModelConfig (`cobra/conf/models.py`); override with --model.type `ModelRegistry.<MODEL>.model_id`
@@ -204,9 +139,7 @@ class QuantCalibrateConfig:
     max_samples_per_module: int = 5_000_000
 
     # === Outputs ===
-    # 與 quant_pct_apply.py 的命名對齊：
-    #   - quant_calibrate: producer of pct_stats_out（必要） + pct_hi_lo_out / pct_summary_out（便利）
-    #   - quant_pct_apply: consumer of pct_stats_in，producer of pct_hi_lo_out / pct_summary_out
+    #   - quant_calibrate: producer of pct_stats_out + pct_hi_lo_out / pct_summary_out
     pct_stats_out: Path = Path("outputs/quantize/pct_stats.pt")
     pct_hi_lo_out: Path = Path("outputs/quantize/pct_hi_lo.pt")
     pct_summary_out: Path = Path("outputs/quantize/pct_calibrate_summary.json")
@@ -324,19 +257,6 @@ def _build_target_module_map_from_wrap_registry(
     cfg: QuantCalibrateConfig,
     wrap_registry,
 ) -> Dict[str, List[str]]:
-    """
-    Build a mapping {canonical_target -> [module_qualified_name, ...]} using the WrapRegistry.
-
-    We rely on `wrap_registry.module_paths_by_target(include_targets=_CANONICAL_TARGETS)`
-    to ensure that:
-        - The modules we collect activations from are *exactly* those that would later be
-          wrapped/quantized under the same wrap policy.
-        - Coverage accounting (wrapped vs observed vs calibrated) uses a consistent vocabulary.
-
-    Notes:
-        - 哪些 target 有啟用 percentile pipeline，現在由 cfg.quant_cfg.use_pct_for 決定。
-        - 如果某個 target 在目前 policy 底下沒有任何 wrapped modules，就不會出現在輸出。
-    """
     # Modules considered "wrapped" (i.e., eligible for quantization) under the current policy.
     modules_by_target: Mapping[str, Sequence[str]] = wrap_registry.module_paths_by_target(
         include_targets=_CANONICAL_TARGETS
@@ -434,20 +354,6 @@ def _summarize_hi_lo_map(
 
 @draccus.wrap()
 def quant_calibrate(cfg: QuantCalibrateConfig) -> None:
-    """
-    Build a mapping {canonical_target -> [module_qualified_name, ...]} using the WrapRegistry.
-
-    We rely on `wrap_registry.module_paths_by_target(include_targets=_CANONICAL_TARGETS)`
-    to ensure that:
-        - The modules we collect activations from are *exactly* those that would later be
-          wrapped/quantized under the same wrap policy.
-        - Coverage accounting (wrapped vs observed vs calibrated) uses a consistent vocabulary.
-
-    Notes:
-        - 哪些 target 有啟用 percentile pipeline，現在由 cfg.quant_cfg.use_pct_for 決定。
-        - 如果某個 target 在目前 policy 底下沒有任何 wrapped modules，就不會出現在輸出。
-    """
-
     # ------------------------------------------------------------------
     # Basic Setup
     # ------------------------------------------------------------------
@@ -600,8 +506,6 @@ def quant_calibrate(cfg: QuantCalibrateConfig) -> None:
     # ------------------------------------------------------------------
     # Optional LLM tap context (for Mamba backbone activations)
     # ------------------------------------------------------------------
-    # 決定是否啟用 LLM tap context 時，也改成以 quant_cfg.use_pct_for 為準，避免
-    # enable_llm 與 use_pct_for 不一致時產生混亂。
     llm_tap_ctx: Optional[LLMActivationTapContext] = None
     if "llm" in cfg.quant_cfg.use_pct_for:
         llm_tap_ctx = LLMActivationTapContext(
@@ -700,7 +604,6 @@ def quant_calibrate(cfg: QuantCalibrateConfig) -> None:
 
     # ------------------------------------------------------------------
     # Convenience mode: Run Best-Percentile → hi/lo（不動 model，本地只產生 hi/lo）
-    #   - 若要走純「Minimal + quant_pct_apply」路線，只需忽略本段產物即可。
     # ------------------------------------------------------------------
     overwatch.info(
         "[QuantCalibrate] Running best-percentile selection + hi/lo mapping (no model calibration)",
@@ -733,7 +636,7 @@ def quant_calibrate(cfg: QuantCalibrateConfig) -> None:
     torch.save(hi_lo_map, cfg.pct_hi_lo_out)
 
     # ------------------------------------------------------------------
-    # Build JSON summary (similar to quant_pct_apply，但以 calibrate 為主)
+    # Build JSON summary 
     # ------------------------------------------------------------------
     entries = _summarize_hi_lo_map(hi_lo_map)
 
@@ -751,7 +654,6 @@ def quant_calibrate(cfg: QuantCalibrateConfig) -> None:
             "enabled_targets": enabled_targets,
             "quant_bits": cfg.quant_bits,
             "backend": cfg.backend,
-            # 與 quant_pct_apply 的 summary 對齊的欄位
             "quant_use_pct_for": sorted(cfg.quant_cfg.use_pct_for),
             "targets_effective": enabled_targets,
         },
