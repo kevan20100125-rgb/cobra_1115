@@ -122,7 +122,7 @@ PCT_HI_LO="outputs/quantize/pct_hi_lo_${BITS}.pt"
 PCT_SUMMARY="outputs/quantize/pct_calibrate_summary_${BITS}.json"
 INT_EXPORT="outputs/quantize/int_export_${BITS}.pt"
 
-export BITS W_BITS A_BITS
+export BITS
 export PCT_STATS PCT_HI_LO PCT_SUMMARY INT_EXPORT SMOKE
 # 讓後續 Python / runtime 都看到 ROTATION_MODE，並且把它同步到
 # load_quantized_vlm.py 用的 COBRA_PROJECTOR_ROTATION_MODE。
@@ -144,7 +144,6 @@ from cobra.switches.quant_calibrate import QuantCalibrateConfig, quant_calibrate
 from cobra.conf.datasets import DatasetConfig, DatasetRegistry
 
 BITS = os.environ.get("BITS", "W8A8")
-A_BITS = int(os.environ.get("A_BITS", "8"))
 SMOKE = int(os.environ.get("SMOKE", "0"))
 
 pct_stats_out = Path(os.environ["PCT_STATS"])
@@ -159,7 +158,8 @@ calib_dataset_cfg = calib_cfg_cls()
 
 # 基本設定：bit / dataset / 輸出路徑
 base_cfg_kwargs = dict(
-    act_bits=A_BITS,
+    quant_bits=BITS,
+    backend="fake",
     pct_stats_out=pct_stats_out,
     pct_hi_lo_out=pct_hi_lo_out,
     pct_summary_out=pct_summary_out,
@@ -190,7 +190,10 @@ else:
         # per_device_batch_size=8, num_workers=4, max_calib_batches=0 ...
     )
 
-print(f"[QuantCalibrate] Running with BITS={BITS}, act_bits={cfg.act_bits}, smoke={SMOKE}")
+print(
+    f"[QuantCalibrate] Running with quant_bits={cfg.quant_bits}, "
+    f"resolved act_bits={cfg.act_bits}, smoke={SMOKE}"
+)
 quant_calibrate(cfg)
 PY
 
@@ -212,8 +215,6 @@ from pathlib import Path
 
 from cobra.switches.quant_finalize import QuantFinalizeConfig, run_quant_finalize
 
-W_BITS = int(os.environ.get("W_BITS", "8"))
-A_BITS = int(os.environ.get("A_BITS", "8"))
 ROTATION_MODE = os.environ.get("ROTATION_MODE", "hk")
 
 pct_hi_lo_in = Path(os.environ["PCT_HI_LO"])
@@ -221,8 +222,8 @@ out_path = Path(os.environ["INT_EXPORT"])
 
 cfg = QuantFinalizeConfig(
     pct_hi_lo_in=pct_hi_lo_in,
-    weight_bits=W_BITS,
-    act_bits=A_BITS,
+    quant_bits=BITS,
+    backend="int",
     signed_weights=True,
     signed_activations=True,
     include_vision_dino=True,
@@ -241,7 +242,8 @@ cfg = QuantFinalizeConfig(
 )
 
 print(
-    f"[QuantFinalize] Running with W_BITS={W_BITS}, A_BITS={A_BITS}, "
+    f"[QuantFinalize] Running with quant_bits={cfg.quant_bits} "
+    f"(resolved W_BITS={cfg.weight_bits}, A_BITS={cfg.act_bits}), "
     f"projector_rotation_mode={ROTATION_MODE}"
 )
 run_quant_finalize(cfg)
@@ -251,5 +253,6 @@ PY
 fi
 
 echo "[DONE] cobra_1115 PTQ pipeline complete (MODE=${MODE}, BITS=${BITS}, SMOKE=${SMOKE})."
+
 
 
