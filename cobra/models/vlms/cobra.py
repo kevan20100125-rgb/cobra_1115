@@ -14,6 +14,7 @@ from functools import partial
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Type, Union
 
+import os
 import torch
 from PIL import Image
 from torch.distributed.fsdp.wrap import _module_wrap_policy, _or_policy
@@ -23,6 +24,7 @@ from cobra.models.backbones.llm import LLMBackbone, MambaLLMBackbone
 from cobra.models.backbones.llm.prompting import PromptBuilder
 from cobra.models.backbones.vision import VisionBackbone
 from cobra.models.vlms.base_vlm import VLM
+from cobra.models.vlms.fusion import FusionStage
 from cobra.overwatch import initialize_overwatch
 from cobra.util.nn_utils import FusedMLPProjector, LinearProjector, MLPProjector, FusedLDPProjector
 from cobra.models.mamba.modeling_mamba import GenerationMixin as MambaGenerationMixin
@@ -74,6 +76,8 @@ class CobraVLM(VLM):
         # Set Module Keys =>> used in Checkpoint Saving / Model Loading
         self.all_module_keys = ["vision_backbone", "llm_backbone", "projector"]
         self.trainable_module_keys = []
+        # Explicit module for: concat -> fused_embeddings -> (global ops later)
+        self.fusion_stage = FusionStage()
 
         # === Generation Utilities ===
         #   => For computing likelihoods --> get tokens corresponding to "True", "False" and "Yes", "No"
@@ -336,6 +340,8 @@ class CobraVLM(VLM):
             if isinstance(pixel_values, dict):
                 patch_features = self.vision_backbone({k: pixel_values[k][multimodal_indices] for k in pixel_values})
             elif pixel_values is None:  # For cache phase in mamba's generate()
+                if os.environ.get("COBRA_DEBUG_FLOW", "").strip().lower() in ("1", "true", "yes", "on"):
+                    print("[CobraVLM.forward] cache-phase (t>=2): pixel_values=None -> skip fusion_stage (Point B)")
                 return self.llm_backbone(
                 input_ids=input_ids,
                 attention_mask=None,
@@ -351,7 +357,11 @@ class CobraVLM(VLM):
                 num_last_tokens=num_last_tokens,
             )
             else:
+                if os.environ.get("COBRA_DEBUG_FLOW", "").strip().lower() in ("1", "true", "yes", "on"):
+                    print("[CobraVLM.forward] multimodal-phase (t=1): pixel_values!=None -> will apply fusion_stage (Point B)")
                 patch_features = self.vision_backbone(pixel_values[multimodal_indices])
+        
+
 
         # Projection Logic :: [bsz, num_patches, llm_embed_dim] =>> num_patches = (2 *) (256 + 1) for ViT-L + CLS
         projected_patch_embeddings = self.projector(patch_features)
@@ -394,12 +404,8 @@ class CobraVLM(VLM):
         if len(unimodal_indices) == 0:
             fused_embeddings = multimodal_embeddings
             fused_labels = multimodal_labels
-
         else:
             # Otherwise --> Merge w/ unimodal data
-
-            # This doesn't matter --> but in the "normal" case this is the embedding of the <PAD> token
-            #   => NOTE :: Verified that `zeros/randn/empty/<PAD> embedding` all return the same result!
             unimodal_embeddings_pad = torch.zeros(
                 (len(unimodal_indices), projected_patch_embeddings.shape[1], input_embeddings.shape[2]),
                 dtype=input_embeddings.dtype,
@@ -418,6 +424,9 @@ class CobraVLM(VLM):
             # Create "Fused" Tensors by Stacking Multimodal & Unimodal
             fused_embeddings = torch.vstack([multimodal_embeddings, unimodal_embeddings])
             fused_labels = torch.vstack([multimodal_labels, unimodal_labels])
+
+        # IMPORTANT: Point B hook must always run for t=1 multimodal forward
+        fused_embeddings = self.fusion_stage(fused_embeddings)
 
         # Run LLM Forward --> returns CausalLMOutputWithPast!
         return self.llm_backbone(
@@ -575,3 +584,4 @@ class CobraVLM(VLM):
         generated_text = tokenizer.decode(generated_ids[0, input_ids.shape[1] :], skip_special_tokens=True).strip()
 
         return generated_text
+

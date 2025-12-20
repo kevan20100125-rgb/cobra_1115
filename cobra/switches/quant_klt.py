@@ -14,10 +14,8 @@ Responsibilities:
     4) Compute feature covariance C = (W_centered^T @ W_centered) / (N - 1).
     5) Compute eigen-decomposition C = Q Λ Q^T, and take K = Q (d_model x d_model).
     6) Save shared K to disk (e.g., outputs/quantize/shared_klt.pt), to be consumed by
-       both:
-         - `quant_finalize.py` for offline INT export (R = H K rotation), and
          - runtime loaders (e.g. `quantize/runtime/load_quantized_vlm.py`) for
-           fake / INT backends that want to apply the same projector rotation.
+           fake backend that want to apply the same projector rotation.
 """
 
 from __future__ import annotations

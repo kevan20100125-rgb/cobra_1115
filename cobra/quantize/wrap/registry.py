@@ -22,11 +22,27 @@ import torch.nn as nn
 from cobra.overwatch import initialize_overwatch
 
 from .manifest import WrapRule, find_wrap_rule_for_module, iter_default_wrap_rules
-from .policy import DefaultWrapPolicy, WrapPolicyConfig
+from .policy import DefaultWrapPolicy, WrapPolicyConfig, infer_target_from_module_path
 from .utils import is_quantized_module
 
 overwatch = initialize_overwatch(__name__)
 
+def _pct_only_noop_factory(module: nn.Module, params) -> nn.Module:
+    """
+    "pct_only" entries are for activation clipping calibration/coverage only.
+
+    They must NOT change the module instance, and must NOT trigger in-place
+    replacement in wrap_replace().
+    """
+    return module
+
+
+PCT_ONLY_RULE: WrapRule = WrapRule(
+    source_cls=nn.Module,
+    wrap_kind="pct_only",
+    factory=_pct_only_noop_factory,
+    allow_subclass=True,
+)
 
 @dataclass(frozen=True)
 class WrapEntry:
@@ -165,6 +181,23 @@ def build_wrap_registry(
         if is_quantized_module(module):
             continue
 
+        # --------------------------------------------------------------
+        # Fusion stage as a formal target:
+        # Add a "pct_only" entry for activation clipping calibration/coverage.
+        # This entry must not trigger actual weight wrapping.
+        # --------------------------------------------------------------
+        if module_path == "fusion_stage":
+            target = infer_target_from_module_path(module_path)
+            if target == "fusion" and policy.cfg.is_target_enabled("fusion"):
+                entry = WrapEntry(
+                    module_path=module_path,
+                    target="fusion",
+                    rule_kind=PCT_ONLY_RULE.wrap_kind,
+                    rule=PCT_ONLY_RULE,
+                )
+                registry.add(entry)
+            continue
+
         rule = find_wrap_rule_for_module(module, manifest=manifest)
         if rule is None:
             continue
@@ -195,3 +228,4 @@ def build_wrap_registry(
         overwatch.info("[WrapRegistry] " + " | ".join(parts))
 
     return registry
+

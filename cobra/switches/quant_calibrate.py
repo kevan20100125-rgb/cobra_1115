@@ -6,21 +6,11 @@ quant_calibrate.py
 CLI entrypoint for percentile-based activation calibration.
 
 Pipeline role (three-stage PTQ):
-    1) quant_calibrate.py
+    quant_calibrate.py
          - Run model + dataloader once
          - Collect activation statistics and build percentile stats
          - (Convenience mode) Optionally convert stats → hi/lo directly
            and write pct_hi_lo_out + pct_summary_out
-    2) quant_pct_apply.py
-         - Pure offline step: pct_stats_in → hi/lo (+ summary)
-         - Used when you want to re-run percentile decision logic without
-           touching the model / dataloader
-    3) quant_finalize.py
-         - Load float checkpoint
-         - Wrap modules with Quant* kernels
-         - Apply hi/lo into activation quantizers
-         - Apply projector rotation (R = H K)
-         - Export integer weights + activation quant metadata
 
 Responsibilities of this script:
     - Initialize a Cobra VLM and its pretraining dataset (align / finetune)
@@ -32,29 +22,16 @@ Responsibilities of this script:
           stats -> best-percentile map (internal) -> (hi, lo)
       and save the resulting hi/lo clipping map + JSON summary to disk.
 
-This script does NOT:
-    - Perform weight quantization or integer kernel export (handled by
-      `quantize/finalize/int_export.py` via quant_finalize.py).
-    - Perform module wrapping for runtime inference (handled by
-      `quantize.wrap` and `quantize.runtime.load_quantized_vlm`).
-    - Handle distributed training (FSDP / DDP); it is intended for
-      single-process calibration only.
-
 Design notes in this variant:
     - Quantization-related knobs（bits/backend/哪些 target 進 percentile pipeline）
       由 QuantRuntimeConfig 統一管理：
           * quant_bits + backend -> (weight_bits, act_bits, mode, use_pct_for...)
-      這樣 quant_calibrate / quant_finalize / load_quantized_vlm 共享同一套
+      這樣 quant_calibrate / load_quantized_vlm 共享同一套
       bits/backend/targets 決策邏輯。
     - Vision backbones (DINO / SigLIP) participation in percentile pipeline
       仍由 enable_vision_* + vision_in_pct_pipeline 控制，但實際啟用與否
       會反映在 QuantRuntimeConfig.use_pct_for。
-    - 實際使用上可以區分兩種模式：
-        * Minimal mode:
-            - 只關心 pct_stats_out，當作 quant_pct_apply.py 的輸入
-        * Convenience mode:
-            - 同時產出 pct_hi_lo_out + pct_summary_out，
-              可直接給 quant_finalize.py / load_quantized_vlm 使用
+    - Convenience mode:同時產出 pct_hi_lo_out + pct_summary_out，可直接給 load_quantized_vlm 使用
 """
 
 import json
@@ -75,6 +52,7 @@ from cobra.models import (
     get_vision_backbone_and_transform,
     get_vlm,
 )
+from cobra.models.vlms.fusion import FusionStage
 from cobra.overwatch import initialize_overwatch
 from cobra.preprocessing import get_dataset_and_collator
 from cobra.quantize.pct.collect import (
@@ -87,8 +65,10 @@ from cobra.quantize.pct.collect import (
 )
 from cobra.quantize.pct.apply import build_hi_lo_map
 from cobra.quantize.runtime.config import QuantRuntimeConfig
+from cobra.quantize.runtime.pipeline_spec import CANONICAL_TARGETS, add_fusion_stage_to_target_map
 from cobra.quantize.wrap.policy import WrapPolicyConfig
 from cobra.quantize.wrap.registry import build_wrap_registry
+from cobra.quantize.rotate.projector import SHARED_KLT_PATH, load_klt_matrix
 from cobra.util import set_global_seed
 
 # Disable Tokenizers Parallelism to Play Nice w/ PyTorch Multiprocessing DataLoaders
@@ -105,48 +85,6 @@ overwatch = initialize_overwatch(__name__)
 
 @dataclass
 class QuantCalibrateConfig:
-    """
-    Configuration for percentile-based activation calibration.
-
-    Note:
-    This CLI is now **collect-only**:
-    it builds activation percentile stats and hi/lo clipping bounds,
-    but does not modify the model in-place. Downstream scripts
-    (`quant_pct_apply.py`, `quant_finalize.py`, `cobra.quantize.pct.calibrator`)
-    are responsible for actually applying these parameters to wrapped modules
-    or re-running percentile selection offline.
-
-    Key knobs (旗標):
-        - model / dataset / stage:
-            which pretrained Cobra VLM + dataset split to use.
-        - quant_bits / backend:
-            交給 QuantRuntimeConfig 解析成 weight_bits / act_bits
-            與 use_pct_for / use_rotation_for 等欄位。
-        - tau_growth:
-            growth-ratio threshold for best-percentile selection.
-        - symmetric_clipping:
-            whether to enforce symmetric hi/lo around 0.
-        - enable_*:
-            哪些 canonical targets 允許進 percentile pipeline（會傳給
-            QuantRuntimeConfig.from_bits_backend）。
-        - max_calib_batches:
-            limit how much data to stream.
-        - max_samples_per_module:
-            cap how many activation samples each collector stores.
-        - pct_*_out:
-            output paths for stats / hi-lo map / calibration summary.
-
-    Usage patterns:
-        - Minimal:
-            * run quant_calibrate.py
-            * only consume pct_stats_out as input to quant_pct_apply.py
-        - Convenience:
-            * rely on the internal build_hi_lo_map call to directly
-              produce pct_hi_lo_out + pct_summary_out, then pass
-              pct_hi_lo_out to quant_finalize.py / load_quantized_vlm.py
-    """
-
-
     # === Model / Dataset Selection ===
 
     # ModelConfig (`cobra/conf/models.py`); override with --model.type `ModelRegistry.<MODEL>.model_id`
@@ -180,20 +118,22 @@ class QuantCalibrateConfig:
     max_calib_batches: int = 0
 
     # === Quantization Settings (centralized via QuantRuntimeConfig) ===
-
-    # 原本的 act_bits 保留給 CLI 相容，但實際值會由 quant_bits 解析後覆蓋。
-    act_bits: int = 8
+    # act_bits 保留給 CLI 相容（legacy override）。
+    # 根因修正：預設為 None，表示「不指定」，完全由 quant_bits 推導得到。
+    # 只有在使用者顯式指定 act_bits 且與 quant_bits 推導不一致時才發警告。
+    act_bits: Optional[int] = None
     signed_activations: bool = True
 
     # 統一的 bits/backend 入口（交由 QuantRuntimeConfig 解析）
     quant_bits: str = "W8A8"
     backend: str = "fake"
 
-    # Vision 是否允許進 percentile pipeline：會傳入 QuantRuntimeConfig
+    # 是否允許進 percentile pipeline：會傳入 QuantRuntimeConfig
     enable_vision_dino: bool = True
     enable_vision_siglip: bool = True
     enable_llm: bool = True
     enable_projector: bool = True
+    enable_fusion: bool = True
     vision_in_pct_pipeline: bool = True
 
     # Best-percentile selection hyperparameter (see `best_percentile.py`)
@@ -204,9 +144,7 @@ class QuantCalibrateConfig:
     max_samples_per_module: int = 5_000_000
 
     # === Outputs ===
-    # 與 quant_pct_apply.py 的命名對齊：
-    #   - quant_calibrate: producer of pct_stats_out（必要） + pct_hi_lo_out / pct_summary_out（便利）
-    #   - quant_pct_apply: consumer of pct_stats_in，producer of pct_hi_lo_out / pct_summary_out
+    #   - quant_calibrate: producer of pct_stats_out + pct_hi_lo_out / pct_summary_out
     pct_stats_out: Path = Path("outputs/quantize/pct_stats.pt")
     pct_hi_lo_out: Path = Path("outputs/quantize/pct_hi_lo.pt")
     pct_summary_out: Path = Path("outputs/quantize/pct_calibrate_summary.json")
@@ -236,24 +174,35 @@ class QuantCalibrateConfig:
             config_name=f"quant_calibrate::{self.quant_bits}::{self.backend}",
         )
 
-        # 將 act_bits 與 quant_cfg.act_bits 對齊（若 CLI 指定不一致則發警告並覆蓋）
-        if self.act_bits != self.quant_cfg.act_bits:
-            valid_bits = (2, 4, 8, 16)
+        # ------------------------------------------------------------------
+        # act_bits root-cause fix:
+        # - act_bits defaults to None (meaning: "not specified").
+        # - quant_bits is the single source of truth for resolved act_bits.
+        # - Only warn when the user explicitly provides act_bits and it disagrees.
+        # ------------------------------------------------------------------
+        valid_bits = (2, 4, 8, 16)
+
+        if self.act_bits is None:
+            # Default: no user override; derive from quant_bits.
+            self.act_bits = self.quant_cfg.act_bits
+        else:
+            # User explicitly supplied act_bits: validate + reconcile with quant_bits.
             if self.act_bits not in valid_bits:
                 overwatch.warning(
-                    "[QuantCalibrate] act_bits from CLI is invalid or mismatched "
-                    f"(act_bits={self.act_bits}, quant_bits={self.quant_bits}); "
-                    f"overriding act_bits -> {self.quant_cfg.act_bits}.",
+                    "[QuantCalibrate] act_bits override is invalid; "
+                    "using quant_bits as source of truth.",
                     extra={
                         "stage": "config",
                         "cli_act_bits": self.act_bits,
                         "quant_bits": self.quant_bits,
                         "resolved_act_bits": self.quant_cfg.act_bits,
+                        "valid_bits": valid_bits,
                     },
                 )
-            else:
+                self.act_bits = self.quant_cfg.act_bits
+            elif self.act_bits != self.quant_cfg.act_bits:
                 overwatch.warning(
-                    "[QuantCalibrate] act_bits differs from quant_bits-derived act_bits; "
+                    "[QuantCalibrate] act_bits override differs from quant_bits-derived act_bits; "
                     "using quant_bits as source of truth.",
                     extra={
                         "stage": "config",
@@ -262,7 +211,9 @@ class QuantCalibrateConfig:
                         "resolved_act_bits": self.quant_cfg.act_bits,
                     },
                 )
-        self.act_bits = self.quant_cfg.act_bits
+                self.act_bits = self.quant_cfg.act_bits
+            # else: user override matches derived; keep it (already consistent).
+
 
         # ------------------------------------------------------------------
         # 2) Sanity checks for act_bits（與 QuantRuntimeConfig 對齊後）
@@ -310,43 +261,21 @@ class QuantCalibrateConfig:
 # Target → module mapping helpers
 # =====================================================================
 
-
-_CANONICAL_TARGETS: Tuple[str, ...] = (
-    "vision.dino",
-    "vision.siglip",
-    "llm",
-    "projector",
-)
-
-
 def _build_target_module_map_from_wrap_registry(
     model: nn.Module,
     cfg: QuantCalibrateConfig,
     wrap_registry,
 ) -> Dict[str, List[str]]:
-    """
-    Build a mapping {canonical_target -> [module_qualified_name, ...]} using the WrapRegistry.
-
-    We rely on `wrap_registry.module_paths_by_target(include_targets=_CANONICAL_TARGETS)`
-    to ensure that:
-        - The modules we collect activations from are *exactly* those that would later be
-          wrapped/quantized under the same wrap policy.
-        - Coverage accounting (wrapped vs observed vs calibrated) uses a consistent vocabulary.
-
-    Notes:
-        - 哪些 target 有啟用 percentile pipeline，現在由 cfg.quant_cfg.use_pct_for 決定。
-        - 如果某個 target 在目前 policy 底下沒有任何 wrapped modules，就不會出現在輸出。
-    """
     # Modules considered "wrapped" (i.e., eligible for quantization) under the current policy.
     modules_by_target: Mapping[str, Sequence[str]] = wrap_registry.module_paths_by_target(
-        include_targets=_CANONICAL_TARGETS
+        include_targets = CANONICAL_TARGETS
     )
 
     enabled_targets = cfg.quant_cfg.use_pct_for
 
     target_to_modules: Dict[str, List[str]] = {}
 
-    for target in _CANONICAL_TARGETS:
+    for target in CANONICAL_TARGETS:
         if target not in enabled_targets:
             continue
 
@@ -370,7 +299,7 @@ def _build_target_module_map_from_wrap_registry(
         )
 
     # Logging summary
-    for target in _CANONICAL_TARGETS:
+    for target in CANONICAL_TARGETS:
         mods = target_to_modules.get(target, [])
         if mods:
             overwatch.info(
@@ -381,6 +310,12 @@ def _build_target_module_map_from_wrap_registry(
             overwatch.info(
                 f"[QuantCalibrate] Target={target!r} (from WrapRegistry) → 0 modules"
             )
+
+    add_fusion_stage_to_target_map(
+        model=model,
+        enabled_targets=enabled_targets,
+        target_to_modules=target_to_modules,
+    )
 
     return target_to_modules
 
@@ -426,6 +361,72 @@ def _summarize_hi_lo_map(
 
     return summary
 
+def _configure_fusion_rotation_for_calibration(
+    vlm: nn.Module,
+    *,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> None:
+    """
+    Configure FusionStage rotation mode BEFORE activation collection.
+
+    This aligns calibration stats with the Paper-main Point-B behavior:
+        fused_embeddings := fused_embeddings · R
+        fused_embeddings := clip_best(fused_embeddings)
+        fused_embeddings := quant_dequant_A(fused_embeddings)
+
+    Env keys:
+        - COBRA_FUSION_ROTATION_MODE: none|hadamard|hk
+        - KLT_OUT (optional): preferred KLT path produced by cobra_1115_ptq.sh
+          fallback to SHARED_KLT_PATH for backward compatibility.
+    """
+    # Find fusion_stage
+    fusion_stage = getattr(vlm, "fusion_stage", None)
+    if fusion_stage is None:
+        return
+    if not isinstance(fusion_stage, FusionStage):
+        return
+
+    mode = os.environ.get("COBRA_FUSION_ROTATION_MODE", "none").strip().lower()
+    if mode not in ("none", "hadamard", "hk"):
+        overwatch.warning(
+            "[QuantCalibrate] Unknown COBRA_FUSION_ROTATION_MODE; falling back to 'none'.",
+            extra={"COBRA_FUSION_ROTATION_MODE": mode},
+        )
+        mode = "none"
+
+    K = None
+    klt_loaded = False
+
+    if mode == "hk":
+        # Prefer KLT_OUT (script export), then fallback to SHARED_KLT_PATH.
+        klt_out_env = os.environ.get("KLT_OUT", "").strip()
+        klt_path = Path(klt_out_env) if klt_out_env else SHARED_KLT_PATH
+
+        if not klt_path.is_file():
+            raise FileNotFoundError(
+                f"[QuantCalibrate] FusionStage mode='hk' requires KLT file, but not found: {klt_path}"
+            )
+
+        K = load_klt_matrix(klt_path)
+        if K is None:
+            raise RuntimeError(
+                f"[QuantCalibrate] Failed to load KLT matrix from: {klt_path}"
+            )
+
+        # Move to calibration device/dtype
+        K = K.to(device=device, dtype=dtype)
+        klt_loaded = True
+
+    fusion_stage.configure_rotation(mode=mode, klt_matrix=K)
+
+    overwatch.info(
+        "[QuantCalibrate] Configured fusion_stage rotation for calibration.",
+        extra={
+            "fusion_rotation_mode": mode,
+            "klt_loaded": klt_loaded,
+        },
+    )
 
 # =====================================================================
 # Main Calibration Routine
@@ -434,20 +435,6 @@ def _summarize_hi_lo_map(
 
 @draccus.wrap()
 def quant_calibrate(cfg: QuantCalibrateConfig) -> None:
-    """
-    Build a mapping {canonical_target -> [module_qualified_name, ...]} using the WrapRegistry.
-
-    We rely on `wrap_registry.module_paths_by_target(include_targets=_CANONICAL_TARGETS)`
-    to ensure that:
-        - The modules we collect activations from are *exactly* those that would later be
-          wrapped/quantized under the same wrap policy.
-        - Coverage accounting (wrapped vs observed vs calibrated) uses a consistent vocabulary.
-
-    Notes:
-        - 哪些 target 有啟用 percentile pipeline，現在由 cfg.quant_cfg.use_pct_for 決定。
-        - 如果某個 target 在目前 policy 底下沒有任何 wrapped modules，就不會出現在輸出。
-    """
-
     # ------------------------------------------------------------------
     # Basic Setup
     # ------------------------------------------------------------------
@@ -525,6 +512,16 @@ def quant_calibrate(cfg: QuantCalibrateConfig) -> None:
 
     vlm.to(device=device, dtype=dtype)
     vlm.eval()
+   
+    # ------------------------------------------------------------------
+    # Configure FusionStage rotation BEFORE activation collection.
+    # This aligns calibration stats with Point-B global rotation/clipping/quant.
+    # ------------------------------------------------------------------
+    _configure_fusion_rotation_for_calibration(
+        vlm,
+        device=device,
+        dtype=dtype,
+    )
 
     # ------------------------------------------------------------------
     # Build wrap registry for coverage analysis AND activation collection
@@ -534,6 +531,7 @@ def quant_calibrate(cfg: QuantCalibrateConfig) -> None:
         enable_vision_siglip=cfg.enable_vision_siglip,
         enable_llm=cfg.enable_llm,
         enable_projector=cfg.enable_projector,
+        enable_fusion=cfg.enable_fusion,
     )
     wrap_registry = build_wrap_registry(
         vlm,
@@ -600,8 +598,6 @@ def quant_calibrate(cfg: QuantCalibrateConfig) -> None:
     # ------------------------------------------------------------------
     # Optional LLM tap context (for Mamba backbone activations)
     # ------------------------------------------------------------------
-    # 決定是否啟用 LLM tap context 時，也改成以 quant_cfg.use_pct_for 為準，避免
-    # enable_llm 與 use_pct_for 不一致時產生混亂。
     llm_tap_ctx: Optional[LLMActivationTapContext] = None
     if "llm" in cfg.quant_cfg.use_pct_for:
         llm_tap_ctx = LLMActivationTapContext(
@@ -700,7 +696,6 @@ def quant_calibrate(cfg: QuantCalibrateConfig) -> None:
 
     # ------------------------------------------------------------------
     # Convenience mode: Run Best-Percentile → hi/lo（不動 model，本地只產生 hi/lo）
-    #   - 若要走純「Minimal + quant_pct_apply」路線，只需忽略本段產物即可。
     # ------------------------------------------------------------------
     overwatch.info(
         "[QuantCalibrate] Running best-percentile selection + hi/lo mapping (no model calibration)",
@@ -733,7 +728,7 @@ def quant_calibrate(cfg: QuantCalibrateConfig) -> None:
     torch.save(hi_lo_map, cfg.pct_hi_lo_out)
 
     # ------------------------------------------------------------------
-    # Build JSON summary (similar to quant_pct_apply，但以 calibrate 為主)
+    # Build JSON summary 
     # ------------------------------------------------------------------
     entries = _summarize_hi_lo_map(hi_lo_map)
 
@@ -751,7 +746,6 @@ def quant_calibrate(cfg: QuantCalibrateConfig) -> None:
             "enabled_targets": enabled_targets,
             "quant_bits": cfg.quant_bits,
             "backend": cfg.backend,
-            # 與 quant_pct_apply 的 summary 對齊的欄位
             "quant_use_pct_for": sorted(cfg.quant_cfg.use_pct_for),
             "targets_effective": enabled_targets,
         },
@@ -853,26 +847,26 @@ def quant_calibrate(cfg: QuantCalibrateConfig) -> None:
 
     # Wrapped modules according to wrap policy/manifest
     wrapped_modules_by_target = wrap_registry.module_paths_by_target(
-        include_targets=_CANONICAL_TARGETS
+        include_targets = CANONICAL_TARGETS
     )
 
     # Activation coverage from stats (collectors)
-    observed_by_target: Dict[str, set] = {t: set() for t in _CANONICAL_TARGETS}
+    observed_by_target: Dict[str, set] = {t: set() for t in CANONICAL_TARGETS}
     for rec in stats.values():
         tgt = str(rec.get("target", ""))
         mod = str(rec.get("module", ""))
-        if tgt in _CANONICAL_TARGETS and mod:
+        if tgt in CANONICAL_TARGETS and mod:
             observed_by_target[tgt].add(mod)
 
     # Calibration coverage from hi/lo map
-    calibrated_by_target: Dict[str, set] = {t: set() for t in _CANONICAL_TARGETS}
+    calibrated_by_target: Dict[str, set] = {t: set() for t in CANONICAL_TARGETS}
     for _, rec in hi_lo_map.items():
         tgt = str(rec.get("target", ""))
         mod = str(rec.get("module", ""))
-        if tgt in _CANONICAL_TARGETS and mod:
+        if tgt in CANONICAL_TARGETS and mod:
             calibrated_by_target[tgt].add(mod)
 
-    for tgt in _CANONICAL_TARGETS:
+    for tgt in CANONICAL_TARGETS:
         wrapped = set(wrapped_modules_by_target.get(tgt, []))
         num_wrapped = len(wrapped)
 
@@ -922,4 +916,5 @@ def quant_calibrate(cfg: QuantCalibrateConfig) -> None:
 
 if __name__ == "__main__":
     quant_calibrate()
+
 
