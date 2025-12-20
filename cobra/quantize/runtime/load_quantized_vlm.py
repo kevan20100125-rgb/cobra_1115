@@ -18,6 +18,55 @@ Design principles:
   - QuantRuntimeConfig is the single source of truth for runtime behavior.
   - This file performs *plumbing* only (load + wrap + apply stats + configure
     optional rotations). It does not compute calibration stats.
+load_quantized_vlm.py
+
+Unified entrypoint for reconstructing a *fake-quantized* Cobra VLM from:
+    • float checkpoint (loaded by cobra.load)
+    • pct_hi_lo  (activation clipping ranges, produced by quant_calibrate.py
+                  or quant_pct_apply.py)
+
+This file is used ONLY at inference time (eval), not for calibration.
+
+Design aligned with the W4/W8 fake-quant PTQ pipeline:
+    - Use `quantize.wrap.wrap_model_for_quantization` to wrap the
+      float Cobra model with Quant* modules (MambaQuant-style fake quant).
+      All kernels remain PyTorch float kernels with quantize/dequant around them.
+    - Load (hi, lo) clipping bounds from `pct_hi_lo_path` (torch.save dict).
+    - Use `pct.calibrator.calibrate_model_from_hi_lo` to convert (hi, lo) to
+      affine activation quantization parameters (scale, zero_point, n_bits)
+      and write them into activation quantizers.
+    - Activation bitwidth (A) is derived from QuantRuntimeConfig.act_bits
+      (parsed from `bits`, e.g. "W8A4" -> act_bits=4).
+
+Notes (Phase 1, runtime unification):
+    - Quantization設定（bits/backend/哪些 target 進 percentile pipeline）交給
+      `QuantRuntimeConfig.from_bits_backend` 處理：
+        * bits    -> (weight_bits, act_bits)
+        * backend -> mode ∈ {FLOAT, FAKE}
+        * enable_* / vision_in_pct_pipeline -> use_pct_for（哪些 target 會被校正）
+    - 本檔只處理「推論時的 fake quant 重建」：
+        * bits/backend/targets 的解析：QuantRuntimeConfig
+        * wrap：wrap_model_for_quantization + WrapPolicyConfig
+        * pct_hi_lo 應用：calibrate_model_from_hi_lo(include_targets=use_pct_for)
+
+Notes (Phase 2, config single-source):
+    - calibrate_model_from_hi_lo 的 include_targets 與 signed 參數均來自
+      QuantRuntimeConfig（use_pct_for / symmetric_acts），確保與
+      quant_calibrate / quant_finalize 完全一致。
+
+Notes (Phase 2+, projector rotation):
+    - 是否允許 projector rotation 由 QuantRuntimeConfig.use_rotation_for /
+      QuantRuntimeConfig.should_rotate_projector() 決定，確保：
+        * runtime (fake / 未來 INT) 使用同一 gating 策略。
+    - projector rotation 模式（"hk" / "hadamard" / "none"）由
+      QuantRuntimeConfig.projector_rotation_mode 管理；來源可以是：
+        * CLI（quant_finalize）或
+        * 環境變數 COBRA_PROJECTOR_ROTATION_MODE（runtime）
+    - 實際旋轉邏輯（KLT + Hadamard）集中在
+        `cobra.quantize.rotate.projector`：
+        * SHARED_KLT_PATH
+        * ProjectorRotationConfig
+        * rotate_cobra_vlm_output_projector_from_path_inplace(...)
 """
 
 from __future__ import annotations
@@ -184,6 +233,35 @@ def _configure_llm_xt_only_activation_quant(vlm: nn.Module, quant_cfg: QuantRunt
     n_total = 0
     n_enabled = 0
     n_missing_quantizer = 0
+def _classify_target_from_module_name(module_name: str) -> str:
+    """
+    Heuristic mapping from module qualified name to canonical target.
+
+    This mirrors the logic used in percentile calibration so that we can
+    group activation quantizers by:
+        - "vision.dino"
+        - "vision.siglip"
+        - "llm"
+        - "projector"
+    """
+    if module_name.startswith("vision_backbone.dino_featurizer") or module_name.startswith(
+        "vision_backbone.featurizer"
+    ):
+        return "vision.dino"
+    if module_name.startswith("vision_backbone.siglip_featurizer"):
+        return "vision.siglip"
+    if module_name.startswith("llm_backbone.llm"):
+        return "llm"
+    if module_name.startswith("projector"):
+        return "projector"
+    return "<unknown>"
+
+
+def _summarize_activation_quantizers(model: nn.Module, *, header: str) -> None:
+    """
+    Inspect all activation quantizers in the wrapped model and print coverage
+    statistics per canonical target, focusing on whether `scale` has been
+    populated (i.e., calibration actually wrote parameters into them).
 
     for name, mod in llm.named_modules():
         if not isinstance(mod, QuantLinear):
@@ -234,6 +312,11 @@ def _apply_runtime_weight_bits(vlm: nn.Module, quant_cfg: QuantRuntimeConfig) ->
         next forward.
     """
     if quant_cfg.mode is not QuantMode.FAKE:
+        # Only meaningful for FAKE runtime; FLOAT is handled elsewhere.
+        print(
+            "[load_quantized_cobra_vlm] _apply_runtime_weight_bits called with "
+            f"mode={quant_cfg.mode.value}; skipping."
+        )
         return
 
     w_bits = quant_cfg.weight_bits
@@ -414,6 +497,8 @@ def load_quantized_cobra_vlm(
             String like "W8A8", "W4A4", "W2A2", "W16A16", "W8A4", "W4A8".
         pct_hi_lo_path:
             Path to the hi/lo map produced by quant_calibrate.py.
+            Path to the hi/lo clipping map produced by `quant_calibrate.py`
+            or `quant_pct_apply.py`.
         hf_token:
             HF token passed to cobra.load().
         base_dtype:
@@ -475,6 +560,24 @@ def load_quantized_cobra_vlm(
     # ------------------------------------------------------------------
     print("[load_quantized_cobra_vlm] Wrapping model with fake-quant modules via wrap_model_for_quantization(...)")
 
+    if quant_cfg.mode is QuantMode.FLOAT:
+        # Pure float: no wrap, no calibration, no pct consumed.
+        print("[load_quantized_cobra_vlm] QuantMode=FLOAT; returning float Cobra without wrapping.")
+        return vlm
+
+    # From here on we are in FAKE mode (current main path).
+    assert quant_cfg.mode is QuantMode.FAKE
+
+    # ------------------------------------------------------------------
+    # 3. Wrap model with Quant* modules (fake quant)
+    # ------------------------------------------------------------------
+    print(
+        "[load_quantized_cobra_vlm] Wrapping model with Quant* modules via "
+        "wrap_model_for_quantization(...)"
+    )
+
+    # Wrap policy aligned with QuantRuntimeConfig.use_pct_for: we only wrap
+    # targets that participate in the percentile pipeline.
     wrap_policy_cfg = WrapPolicyConfig(
         enable_vision_dino="vision.dino" in enabled_targets_set,
         enable_vision_siglip="vision.siglip" in enabled_targets_set,
