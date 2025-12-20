@@ -71,6 +71,7 @@ _CANONICAL_TARGETS = (
 
 
 @dataclass
+@dataclass
 class WrapPolicyConfig:
     """
     Configuration for the default wrapping policy.
@@ -80,6 +81,7 @@ class WrapPolicyConfig:
         - enable_vision_siglip
         - enable_llm
         - enable_projector
+        - enable_fusion
 
     Op-kind inclusion flags:
         - include_linear:  wrap nn.Linear-like modules
@@ -96,6 +98,7 @@ class WrapPolicyConfig:
     enable_vision_siglip: bool = True
     enable_llm: bool = True
     enable_projector: bool = True
+    enable_fusion: bool = True
 
     # Op kinds
     include_linear: bool = True
@@ -115,6 +118,8 @@ class WrapPolicyConfig:
             return self.enable_llm
         if target == "projector":
             return self.enable_projector
+        if target == "fusion":
+            return self.enable_fusion
         return False
 
 
@@ -128,6 +133,8 @@ def infer_target_from_module_path(module_path: str) -> Optional[str]:
     Infer the canonical target name from a module's qualified path.
 
     Heuristics are intentionally aligned with:
+        - Fusion stage (Point-B):
+            * "fusion_stage" or "fusion_stage.*"     -> "fusion"
         - Vision backbones:
             * "vision_backbone.dino_featurizer.*"    -> "vision.dino"
             * "vision_backbone.featurizer.*"         -> "vision.dino"
@@ -140,6 +147,15 @@ def infer_target_from_module_path(module_path: str) -> Optional[str]:
     Returns:
         A canonical target string, or None if no mapping applies.
     """
+    module_path = (module_path or "").strip()
+    if not module_path:
+        return None
+
+    # Fusion stage (Point-B)
+    if module_path == "fusion_stage" or module_path.startswith("fusion_stage."):
+        return "fusion"
+
+    # Vision
     if module_path.startswith("vision_backbone.dino_featurizer"):
         return "vision.dino"
     if module_path.startswith("vision_backbone.featurizer"):
@@ -147,10 +163,15 @@ def infer_target_from_module_path(module_path: str) -> Optional[str]:
         return "vision.dino"
     if module_path.startswith("vision_backbone.siglip_featurizer"):
         return "vision.siglip"
+
+    # LLM
     if module_path.startswith("llm_backbone.llm"):
         return "llm"
+
+    # Projector
     if module_path.startswith("projector"):
         return "projector"
+
     return None
 
 
@@ -317,4 +338,5 @@ def build_default_policy(cfg: Optional[WrapPolicyConfig] = None) -> DefaultWrapP
         policy.cfg,
     )
     return policy
+
 

@@ -27,7 +27,7 @@ from cobra.quantize.quantizer import UniformAffineQuantizer
 # Target normalization
 # ---------------------------------------------------------------------------
 
-ALLOWED_TARGETS = {"vision.dino", "vision.siglip", "llm", "projector"}
+ALLOWED_TARGETS = {"vision.dino", "vision.siglip", "llm", "projector", "fusion"}
 
 # Legacy / alias → canonical target mapping
 LEGACY_TARGET_MAP: Dict[str, str] = {
@@ -54,7 +54,7 @@ def normalize_target(name: str) -> str:
         - "vision.siglip"
         - "llm"
         - "projector"
-
+        - "fusion"
     Raises:
         KeyError: if the name cannot be normalized.
     """

@@ -52,6 +52,7 @@ from cobra.models import (
     get_vision_backbone_and_transform,
     get_vlm,
 )
+from cobra.models.vlms.fusion import FusionStage
 from cobra.overwatch import initialize_overwatch
 from cobra.preprocessing import get_dataset_and_collator
 from cobra.quantize.pct.collect import (
@@ -64,8 +65,10 @@ from cobra.quantize.pct.collect import (
 )
 from cobra.quantize.pct.apply import build_hi_lo_map
 from cobra.quantize.runtime.config import QuantRuntimeConfig
+from cobra.quantize.runtime.pipeline_spec import CANONICAL_TARGETS, add_fusion_stage_to_target_map
 from cobra.quantize.wrap.policy import WrapPolicyConfig
 from cobra.quantize.wrap.registry import build_wrap_registry
+from cobra.quantize.rotate.projector import SHARED_KLT_PATH, load_klt_matrix
 from cobra.util import set_global_seed
 
 # Disable Tokenizers Parallelism to Play Nice w/ PyTorch Multiprocessing DataLoaders
@@ -115,20 +118,22 @@ class QuantCalibrateConfig:
     max_calib_batches: int = 0
 
     # === Quantization Settings (centralized via QuantRuntimeConfig) ===
-
-    # 原本的 act_bits 保留給 CLI 相容，但實際值會由 quant_bits 解析後覆蓋。
-    act_bits: int = 8
+    # act_bits 保留給 CLI 相容（legacy override）。
+    # 根因修正：預設為 None，表示「不指定」，完全由 quant_bits 推導得到。
+    # 只有在使用者顯式指定 act_bits 且與 quant_bits 推導不一致時才發警告。
+    act_bits: Optional[int] = None
     signed_activations: bool = True
 
     # 統一的 bits/backend 入口（交由 QuantRuntimeConfig 解析）
     quant_bits: str = "W8A8"
     backend: str = "fake"
 
-    # Vision 是否允許進 percentile pipeline：會傳入 QuantRuntimeConfig
+    # 是否允許進 percentile pipeline：會傳入 QuantRuntimeConfig
     enable_vision_dino: bool = True
     enable_vision_siglip: bool = True
     enable_llm: bool = True
     enable_projector: bool = True
+    enable_fusion: bool = True
     vision_in_pct_pipeline: bool = True
 
     # Best-percentile selection hyperparameter (see `best_percentile.py`)
@@ -169,24 +174,35 @@ class QuantCalibrateConfig:
             config_name=f"quant_calibrate::{self.quant_bits}::{self.backend}",
         )
 
-        # 將 act_bits 與 quant_cfg.act_bits 對齊（若 CLI 指定不一致則發警告並覆蓋）
-        if self.act_bits != self.quant_cfg.act_bits:
-            valid_bits = (2, 4, 8, 16)
+        # ------------------------------------------------------------------
+        # act_bits root-cause fix:
+        # - act_bits defaults to None (meaning: "not specified").
+        # - quant_bits is the single source of truth for resolved act_bits.
+        # - Only warn when the user explicitly provides act_bits and it disagrees.
+        # ------------------------------------------------------------------
+        valid_bits = (2, 4, 8, 16)
+
+        if self.act_bits is None:
+            # Default: no user override; derive from quant_bits.
+            self.act_bits = self.quant_cfg.act_bits
+        else:
+            # User explicitly supplied act_bits: validate + reconcile with quant_bits.
             if self.act_bits not in valid_bits:
                 overwatch.warning(
-                    "[QuantCalibrate] act_bits from CLI is invalid or mismatched "
-                    f"(act_bits={self.act_bits}, quant_bits={self.quant_bits}); "
-                    f"overriding act_bits -> {self.quant_cfg.act_bits}.",
+                    "[QuantCalibrate] act_bits override is invalid; "
+                    "using quant_bits as source of truth.",
                     extra={
                         "stage": "config",
                         "cli_act_bits": self.act_bits,
                         "quant_bits": self.quant_bits,
                         "resolved_act_bits": self.quant_cfg.act_bits,
+                        "valid_bits": valid_bits,
                     },
                 )
-            else:
+                self.act_bits = self.quant_cfg.act_bits
+            elif self.act_bits != self.quant_cfg.act_bits:
                 overwatch.warning(
-                    "[QuantCalibrate] act_bits differs from quant_bits-derived act_bits; "
+                    "[QuantCalibrate] act_bits override differs from quant_bits-derived act_bits; "
                     "using quant_bits as source of truth.",
                     extra={
                         "stage": "config",
@@ -195,7 +211,9 @@ class QuantCalibrateConfig:
                         "resolved_act_bits": self.quant_cfg.act_bits,
                     },
                 )
-        self.act_bits = self.quant_cfg.act_bits
+                self.act_bits = self.quant_cfg.act_bits
+            # else: user override matches derived; keep it (already consistent).
+
 
         # ------------------------------------------------------------------
         # 2) Sanity checks for act_bits（與 QuantRuntimeConfig 對齊後）
@@ -243,15 +261,6 @@ class QuantCalibrateConfig:
 # Target → module mapping helpers
 # =====================================================================
 
-
-_CANONICAL_TARGETS: Tuple[str, ...] = (
-    "vision.dino",
-    "vision.siglip",
-    "llm",
-    "projector",
-)
-
-
 def _build_target_module_map_from_wrap_registry(
     model: nn.Module,
     cfg: QuantCalibrateConfig,
@@ -259,14 +268,14 @@ def _build_target_module_map_from_wrap_registry(
 ) -> Dict[str, List[str]]:
     # Modules considered "wrapped" (i.e., eligible for quantization) under the current policy.
     modules_by_target: Mapping[str, Sequence[str]] = wrap_registry.module_paths_by_target(
-        include_targets=_CANONICAL_TARGETS
+        include_targets = CANONICAL_TARGETS
     )
 
     enabled_targets = cfg.quant_cfg.use_pct_for
 
     target_to_modules: Dict[str, List[str]] = {}
 
-    for target in _CANONICAL_TARGETS:
+    for target in CANONICAL_TARGETS:
         if target not in enabled_targets:
             continue
 
@@ -290,7 +299,7 @@ def _build_target_module_map_from_wrap_registry(
         )
 
     # Logging summary
-    for target in _CANONICAL_TARGETS:
+    for target in CANONICAL_TARGETS:
         mods = target_to_modules.get(target, [])
         if mods:
             overwatch.info(
@@ -301,6 +310,12 @@ def _build_target_module_map_from_wrap_registry(
             overwatch.info(
                 f"[QuantCalibrate] Target={target!r} (from WrapRegistry) → 0 modules"
             )
+
+    add_fusion_stage_to_target_map(
+        model=model,
+        enabled_targets=enabled_targets,
+        target_to_modules=target_to_modules,
+    )
 
     return target_to_modules
 
@@ -346,6 +361,72 @@ def _summarize_hi_lo_map(
 
     return summary
 
+def _configure_fusion_rotation_for_calibration(
+    vlm: nn.Module,
+    *,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> None:
+    """
+    Configure FusionStage rotation mode BEFORE activation collection.
+
+    This aligns calibration stats with the Paper-main Point-B behavior:
+        fused_embeddings := fused_embeddings · R
+        fused_embeddings := clip_best(fused_embeddings)
+        fused_embeddings := quant_dequant_A(fused_embeddings)
+
+    Env keys:
+        - COBRA_FUSION_ROTATION_MODE: none|hadamard|hk
+        - KLT_OUT (optional): preferred KLT path produced by cobra_1115_ptq.sh
+          fallback to SHARED_KLT_PATH for backward compatibility.
+    """
+    # Find fusion_stage
+    fusion_stage = getattr(vlm, "fusion_stage", None)
+    if fusion_stage is None:
+        return
+    if not isinstance(fusion_stage, FusionStage):
+        return
+
+    mode = os.environ.get("COBRA_FUSION_ROTATION_MODE", "none").strip().lower()
+    if mode not in ("none", "hadamard", "hk"):
+        overwatch.warning(
+            "[QuantCalibrate] Unknown COBRA_FUSION_ROTATION_MODE; falling back to 'none'.",
+            extra={"COBRA_FUSION_ROTATION_MODE": mode},
+        )
+        mode = "none"
+
+    K = None
+    klt_loaded = False
+
+    if mode == "hk":
+        # Prefer KLT_OUT (script export), then fallback to SHARED_KLT_PATH.
+        klt_out_env = os.environ.get("KLT_OUT", "").strip()
+        klt_path = Path(klt_out_env) if klt_out_env else SHARED_KLT_PATH
+
+        if not klt_path.is_file():
+            raise FileNotFoundError(
+                f"[QuantCalibrate] FusionStage mode='hk' requires KLT file, but not found: {klt_path}"
+            )
+
+        K = load_klt_matrix(klt_path)
+        if K is None:
+            raise RuntimeError(
+                f"[QuantCalibrate] Failed to load KLT matrix from: {klt_path}"
+            )
+
+        # Move to calibration device/dtype
+        K = K.to(device=device, dtype=dtype)
+        klt_loaded = True
+
+    fusion_stage.configure_rotation(mode=mode, klt_matrix=K)
+
+    overwatch.info(
+        "[QuantCalibrate] Configured fusion_stage rotation for calibration.",
+        extra={
+            "fusion_rotation_mode": mode,
+            "klt_loaded": klt_loaded,
+        },
+    )
 
 # =====================================================================
 # Main Calibration Routine
@@ -431,6 +512,16 @@ def quant_calibrate(cfg: QuantCalibrateConfig) -> None:
 
     vlm.to(device=device, dtype=dtype)
     vlm.eval()
+   
+    # ------------------------------------------------------------------
+    # Configure FusionStage rotation BEFORE activation collection.
+    # This aligns calibration stats with Point-B global rotation/clipping/quant.
+    # ------------------------------------------------------------------
+    _configure_fusion_rotation_for_calibration(
+        vlm,
+        device=device,
+        dtype=dtype,
+    )
 
     # ------------------------------------------------------------------
     # Build wrap registry for coverage analysis AND activation collection
@@ -440,6 +531,7 @@ def quant_calibrate(cfg: QuantCalibrateConfig) -> None:
         enable_vision_siglip=cfg.enable_vision_siglip,
         enable_llm=cfg.enable_llm,
         enable_projector=cfg.enable_projector,
+        enable_fusion=cfg.enable_fusion,
     )
     wrap_registry = build_wrap_registry(
         vlm,
@@ -755,26 +847,26 @@ def quant_calibrate(cfg: QuantCalibrateConfig) -> None:
 
     # Wrapped modules according to wrap policy/manifest
     wrapped_modules_by_target = wrap_registry.module_paths_by_target(
-        include_targets=_CANONICAL_TARGETS
+        include_targets = CANONICAL_TARGETS
     )
 
     # Activation coverage from stats (collectors)
-    observed_by_target: Dict[str, set] = {t: set() for t in _CANONICAL_TARGETS}
+    observed_by_target: Dict[str, set] = {t: set() for t in CANONICAL_TARGETS}
     for rec in stats.values():
         tgt = str(rec.get("target", ""))
         mod = str(rec.get("module", ""))
-        if tgt in _CANONICAL_TARGETS and mod:
+        if tgt in CANONICAL_TARGETS and mod:
             observed_by_target[tgt].add(mod)
 
     # Calibration coverage from hi/lo map
-    calibrated_by_target: Dict[str, set] = {t: set() for t in _CANONICAL_TARGETS}
+    calibrated_by_target: Dict[str, set] = {t: set() for t in CANONICAL_TARGETS}
     for _, rec in hi_lo_map.items():
         tgt = str(rec.get("target", ""))
         mod = str(rec.get("module", ""))
-        if tgt in _CANONICAL_TARGETS and mod:
+        if tgt in CANONICAL_TARGETS and mod:
             calibrated_by_target[tgt].add(mod)
 
-    for tgt in _CANONICAL_TARGETS:
+    for tgt in CANONICAL_TARGETS:
         wrapped = set(wrapped_modules_by_target.get(tgt, []))
         num_wrapped = len(wrapped)
 
@@ -824,4 +916,5 @@ def quant_calibrate(cfg: QuantCalibrateConfig) -> None:
 
 if __name__ == "__main__":
     quant_calibrate()
+
 

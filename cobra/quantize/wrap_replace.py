@@ -56,6 +56,11 @@ def wrap_model_for_quantization(
 
     # Apply in model order (registry entries are collected in traversal order)
     for entry in registry:
+        # "pct_only" entries are for activation clipping coverage only.
+        # Do not perform in-place replacement, and do not count as wrapped.
+        if entry.rule_kind == "pct_only":
+            continue
+
         old = get_module_by_path(model, entry.module_path)
 
         # Safety: do not double-wrap
@@ -78,3 +83,4 @@ def wrap_model_for_quantization(
     )
 
     return registry
+
