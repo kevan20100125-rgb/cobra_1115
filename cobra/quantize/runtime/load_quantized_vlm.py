@@ -78,21 +78,35 @@ def _resolve_fusion_rotation_mode_from_env() -> str:
     """
     Resolve fusion rotation mode (Point B) from env, with robust fallback.
 
-    Behavior:
-      - If unset: default to "none"  (safety: do not enable silently)
-      - If set: normalize via QuantRuntimeConfig parser
-      - If invalid: warn and fallback to "none"
+    Priority:
+      1) COBRA_FUSION_ROTATION_MODE (explicit)
+      2) COBRA_PROJECTOR_ROTATION_MODE (keep B consistent with projector rotation)
+      3) ROTATION_MODE (legacy / script-level knob)
+      4) default "none" (safety)
+
+    Valid values: "hk" / "hadamard" / "none" (case-insensitive).
     """
+    # 1) Explicit fusion knob
     raw = os.environ.get(ENV_FUSION_ROTATION_MODE, None)
-    if raw is None or not raw.strip():
+
+    # 2) If unset, follow projector rotation knob (common expectation in scripts)
+    if raw is None or not str(raw).strip():
+        raw = os.environ.get(ENV_PROJECTOR_ROTATION_MODE, None)
+
+    # 3) If still unset, follow legacy ROTATION_MODE
+    if raw is None or not str(raw).strip():
+        raw = os.environ.get("ROTATION_MODE", None)
+
+    # 4) Safety default
+    if raw is None or not str(raw).strip():
         return "none"
 
     try:
-        mode_enum = QuantRuntimeConfig._parse_fusion_rotation_mode(raw)
+        mode_enum = QuantRuntimeConfig._parse_fusion_rotation_mode(str(raw))
         return mode_enum.value  # "hk" / "hadamard" / "none"
     except Exception as e:
         print(
-            f"[load_quantized_cobra_vlm] WARNING: invalid {ENV_FUSION_ROTATION_MODE}={raw!r} "
+            f"[load_quantized_cobra_vlm] WARNING: invalid fusion rotation mode={raw!r} "
             f"({type(e).__name__}: {e}); fallback to 'none'."
         )
         return "none"
@@ -120,22 +134,6 @@ def _resolve_model_id_or_path() -> str:
         )
     return env_val
 
-def _load_hi_lo_map(pct_hi_lo_path: Path) -> dict:
-    """
-    Load the hi/lo clipping map produced by `quant_calibrate.py` (torch.save dict).
-    """
-    pct_hi_lo_path = Path(pct_hi_lo_path)
-    if not pct_hi_lo_path.is_file():
-        raise FileNotFoundError(
-            f"[load_quantized_cobra_vlm] pct_hi_lo_path does not exist: {pct_hi_lo_path}"
-        )
-    hi_lo_map = torch.load(pct_hi_lo_path, map_location="cpu")
-    if not isinstance(hi_lo_map, dict):
-        raise TypeError(
-            f"[load_quantized_cobra_vlm] Expected hi_lo_map to be a dict, got {type(hi_lo_map)!r}"
-        )
-    return hi_lo_map
-
 def _load_shared_klt_matrix(*, klt_path: Path, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
     """
     Load shared KLT matrix from a torch.load dict containing key 'K'.
@@ -154,6 +152,87 @@ def _load_shared_klt_matrix(*, klt_path: Path, device: torch.device, dtype: torc
         raise ValueError(f"[load_quantized_cobra_vlm] KLT 'K' must be square [D,D], got shape={tuple(K.shape)}")
 
     return K.to(device=device, dtype=dtype)
+
+def _load_hi_lo_map(*, pct_hi_lo_path: Path) -> dict:
+    """
+    Load pct hi/lo map from disk with strict validation.
+
+    Expected format:
+      - torch.load(...) returns a dict
+      - keys: module names (str)
+      - values: dict with at least {"hi": ..., "lo": ..., "percentile": ...}
+        (exact schema is owned by pct pipeline, we only enforce basic structure)
+
+    Raises:
+      - FileNotFoundError if path is missing or not a file
+      - TypeError / ValueError for invalid formats
+    """
+    if pct_hi_lo_path is None:
+        raise ValueError("[load_quantized_cobra_vlm] pct_hi_lo_path is None (required for fake-quant runtime).")
+
+    if not isinstance(pct_hi_lo_path, Path):
+        pct_hi_lo_path = Path(pct_hi_lo_path)
+
+    # Use is_file (not exists) to avoid passing directories silently
+    if not pct_hi_lo_path.is_file():
+        raise FileNotFoundError(
+            f"[load_quantized_cobra_vlm] pct_hi_lo_path is not a file or does not exist: {str(pct_hi_lo_path)}"
+        )
+
+    obj = torch.load(pct_hi_lo_path, map_location="cpu")
+    if not isinstance(obj, dict):
+        raise TypeError(
+            f"[load_quantized_cobra_vlm] Invalid pct_hi_lo format at {str(pct_hi_lo_path)}; "
+            f"expected dict, got {type(obj)}"
+        )
+
+    return obj
+
+def _build_projector_rotation_cfg_from_mode(rotation_mode: str) -> ProjectorRotationConfig:
+    """
+    Map a runtime rotation_mode string to ProjectorRotationConfig.
+
+    rotation_mode (normalized):
+      - "hk"       => use_klt=True,  use_hadamard=True
+      - "hadamard" => use_klt=False, use_hadamard=True
+      - "none"     => use_klt=False, use_hadamard=False
+
+    Notes
+    -----
+    - ProjectorRotationConfig in this repo is a simple config object whose fields
+      are set after instantiation.
+    """
+    mode = (rotation_mode or "none").strip().lower()
+
+    cfg = ProjectorRotationConfig()
+
+    if mode == "hk":
+        cfg.use_klt = True
+        cfg.use_hadamard = True
+        cfg.shared_klt = True
+        return cfg
+
+    if mode == "hadamard":
+        cfg.use_klt = False
+        cfg.use_hadamard = True
+        cfg.shared_klt = True
+        return cfg
+
+    if mode == "none":
+        cfg.use_klt = False
+        cfg.use_hadamard = False
+        cfg.shared_klt = True
+        return cfg
+
+    # Safety fallback: treat unknown mode as "none"
+    print(
+        f"[load_quantized_cobra_vlm] WARNING: unknown projector rotation_mode={rotation_mode!r}; "
+        "fallback to 'none'."
+    )
+    cfg.use_klt = False
+    cfg.use_hadamard = False
+    cfg.shared_klt = True
+    return cfg
 
 def _configure_llm_xt_only_activation_quant(vlm: nn.Module, quant_cfg: QuantRuntimeConfig) -> None:
     """
@@ -268,7 +347,7 @@ def _apply_runtime_weight_bits(vlm: nn.Module, quant_cfg: QuantRuntimeConfig) ->
         f"(reset_weight_cache={n_reset})."
     )
 
-def _enable_model_fake_quant(vlm: nn.Module, quant_cfg: QuantRuntimeConfig) -> None:
+def _enable_model_fake_quant(vlm: nn.Module, quant_cfg: QuantRuntimeConfig) -> int:
     """
     Enable fake-quant runtime behavior for QuantLinear / QuantConv* modules.
 
@@ -277,9 +356,12 @@ def _enable_model_fake_quant(vlm: nn.Module, quant_cfg: QuantRuntimeConfig) -> N
         this repo (QuantLinear/QuantConv*) control behavior via `set_quant_state`.
       - We intentionally enable *weight* fake quant broadly (when W<16), while
         leaving activation fake quant to be configured separately (e.g., LLM x_t-only).
+
+    Returns:
+        n_touched: number of Quant* modules whose quant state was configured.
     """
     if quant_cfg.mode is not QuantMode.FAKE:
-        return
+        return 0
 
     from cobra.quantize.int_linear import QuantLinear
     from cobra.quantize.int_conv import QuantConv1d, QuantConv2d, QuantConv3d
@@ -288,19 +370,27 @@ def _enable_model_fake_quant(vlm: nn.Module, quant_cfg: QuantRuntimeConfig) -> N
 
     n_touched = 0
     n_failed = 0
-    
-    for _, module in vlm.named_modules():
+    first_err = None
+
+    for name, module in vlm.named_modules():
         if isinstance(module, (QuantLinear, QuantConv1d, QuantConv2d, QuantConv3d)):
             try:
                 module.set_quant_state(weight_quant=weight_quant, act_quant=False)
                 n_touched += 1
-            except Exception:
-                pass
+            except Exception as e:
+                n_failed += 1
+                if first_err is None:
+                    first_err = (name, type(e).__name__, str(e))
+
+    if first_err is not None:
+        n, et, msg = first_err
+        print(f"[load_quantized_cobra_vlm] WARNING: first set_quant_state failure at {n}: {et}: {msg}")
 
     print(
         f"[load_quantized_cobra_vlm] Enabled fake-quant wrappers: touched={n_touched} "
         f"(weight_quant={weight_quant}, act_quant=False, failed={n_failed})."
     )
+    return n_touched
 
 def _disable_vision_activation_quant(vlm: nn.Module) -> None:
     """
@@ -401,7 +491,7 @@ def _absorb_fusion_inverse_into_first_linear(
 def load_quantized_cobra_vlm(
     *,
     bits: str,
-    pct_hi_lo_path: Path,
+    pct_hi_lo_path: Optional[Path],
     hf_token: Optional[str],
     base_dtype: torch.dtype,
     device: torch.device,
@@ -415,19 +505,20 @@ def load_quantized_cobra_vlm(
         pct_hi_lo_path:
             Path to the hi/lo map produced by quant_calibrate.py.
         hf_token:
-            HF token passed to cobra.load().
+            Optional HF token for loading.
         base_dtype:
-            Inference dtype (e.g., torch.bfloat16 / torch.float16).
+            dtype for the loaded float model / runtime.
         device:
-            Target device.
+            target device.
 
     Returns:
-        Wrapped Cobra VLM (float or fake-quant) ready for inference.
+        Cobra VLM ready for evaluation under the configured PTQ runtime.
     """
     # ------------------------------------------------------------------
-    # 0) Build QuantRuntimeConfig from bits + backend + rotation env
+    # 0) Build QuantRuntimeConfig (single source of truth)
     # ------------------------------------------------------------------
     backend = os.environ.get("BACKEND", "fake")
+
     rotation_mode_raw = _resolve_rotation_mode_from_env()
     fusion_rotation_mode_raw = _resolve_fusion_rotation_mode_from_env()
     absorb_fusion_rotation = _resolve_absorb_fusion_rotation_from_env()
@@ -435,12 +526,12 @@ def load_quantized_cobra_vlm(
     quant_cfg = QuantRuntimeConfig.from_bits_backend(
         bits=bits,
         backend=backend,
-        enable_vision_dino=True,
-        enable_vision_siglip=True,
+        enable_vision_dino=False,
+        enable_vision_siglip=False,
         enable_llm=True,
         enable_projector=True,
         enable_fusion=True,
-        vision_in_pct_pipeline=True,
+        vision_in_pct_pipeline=False,
         symmetric_acts=True,
         symmetric_weights=True,
         config_name=f"load_quantized_vlm::{bits}::{backend}",
@@ -467,6 +558,7 @@ def load_quantized_cobra_vlm(
     # ------------------------------------------------------------------
     model_id_or_path = _resolve_model_id_or_path()
     print(f"[load_quantized_cobra_vlm] Loading float Cobra model: {model_id_or_path}")
+
     vlm = cobra_load(model_id_or_path, hf_token=hf_token).to(dtype=base_dtype, device=device)
     vlm.eval()
 
@@ -480,6 +572,7 @@ def load_quantized_cobra_vlm(
         enable_vision_siglip="vision.siglip" in enabled_targets_set,
         enable_llm="llm" in enabled_targets_set,
         enable_projector="projector" in enabled_targets_set,
+        enable_fusion="fusion" in enabled_targets_set,
         include_linear=True,
         include_conv=True,
     )
@@ -495,34 +588,43 @@ def load_quantized_cobra_vlm(
     _apply_runtime_weight_bits(vlm, quant_cfg=quant_cfg)
 
     # ------------------------------------------------------------------
-    # 3) Apply activation hi/lo map (pct) => calibrate activations
+    # 3) Apply activation clipping ranges from pct_hi_lo
     # ------------------------------------------------------------------
-    print(f"[load_quantized_cobra_vlm] Loading activation hi/lo map from {pct_hi_lo_path}")
-    hi_lo_map = _load_hi_lo_map(pct_hi_lo_path)
+    hi_lo_map = _load_hi_lo_map(pct_hi_lo_path=pct_hi_lo_path)
+    print(f"[load_quantized_cobra_vlm] Loading activation hi/lo map from {str(pct_hi_lo_path)}")
 
     calibrate_model_from_hi_lo(
         vlm,
         hi_lo_map,
         include_targets=sorted(quant_cfg.use_pct_for),
+        act_bits=int(quant_cfg.act_bits),
         signed=quant_cfg.symmetric_acts,
     )
 
     if hasattr(vlm, "fusion_stage") and hasattr(vlm.fusion_stage, "mark_clipping_ready"):
         vlm.fusion_stage.mark_clipping_ready()
-    # --- Milestone 4: Global low-bit mapping @ Point B ---
+
+    # --- Global low-bit mapping @ Point B ---
     if hasattr(vlm, "fusion_stage") and hasattr(vlm.fusion_stage, "configure_quant"):
         if quant_cfg.should_quantize_fusion():
             vlm.fusion_stage.configure_quant(n_bits=int(quant_cfg.act_bits), enable=True)
             print(f"[load_quantized_cobra_vlm] Enabled fusion quant-dequant at B with act_bits={quant_cfg.act_bits}")
         else:
-            # explicit disable (keeps Milestone 3 clipping-only behavior)
             vlm.fusion_stage.configure_quant(n_bits=16, enable=False)
             print("[load_quantized_cobra_vlm] Disabled fusion quant-dequant at B")
 
     # ------------------------------------------------------------------
     # 4) Enable fake-quant runtime behavior
     # ------------------------------------------------------------------
-    _enable_model_fake_quant(vlm, quant_cfg=quant_cfg)
+    n_touched = _enable_model_fake_quant(vlm, quant_cfg=quant_cfg)
+
+    if quant_cfg.mode is QuantMode.FAKE and (quant_cfg.weight_bits is not None) and int(quant_cfg.weight_bits) < 16:
+        if n_touched == 0:
+            raise RuntimeError(
+                "[load_quantized_cobra_vlm] FATAL: fake-quant requested (W<16) but no Quant* wrappers were configured "
+                "(touched=0). This run would NOT match the intended PTQ dataflow. "
+                "Most common cause: importing the wrong `cobra` package due to PYTHONPATH order."
+            )
 
     _disable_vision_activation_quant(vlm)
     _configure_llm_xt_only_activation_quant(vlm, quant_cfg=quant_cfg)
@@ -545,43 +647,38 @@ def load_quantized_cobra_vlm(
             K_for_fusion = _load_shared_klt_matrix(klt_path=Path(klt_path), device=device, dtype=base_dtype)
 
         vlm.fusion_stage.configure_rotation(mode=fusion_mode, klt_matrix=K_for_fusion)
+
         print(
             "[load_quantized_cobra_vlm] Configured fusion rotation "
             f"(mode={fusion_mode}, has_klt={K_for_fusion is not None})"
         )
 
         if quant_cfg.should_absorb_fusion_rotation():
-            _absorb_fusion_inverse_into_first_linear(vlm=vlm, fusion_mode=fusion_mode, K=K_for_fusion)
+            _absorb_fusion_inverse_into_first_linear(
+                vlm=vlm,
+                fusion_mode=fusion_mode,
+                K=K_for_fusion,
+            )
+            print(
+                "[load_quantized_cobra_vlm] Absorbed fusion rotation inverse into first LLM linear "
+                f"(mode={fusion_mode})"
+            )
+
 
     # ------------------------------------------------------------------
-    # 6) Optional: apply output projector rotation (existing)
+    # 6) Optional: apply output projector rotation (FIXED API)
     # ------------------------------------------------------------------
     if quant_cfg.should_rotate_projector():
-        effective_use_klt = quant_cfg.projector_rotation_uses_klt()
-        effective_use_hadamard = quant_cfg.projector_rotation_uses_hadamard()
-
-        proj_rot_cfg = ProjectorRotationConfig(
-            use_klt=effective_use_klt,
-            use_hadamard=effective_use_hadamard,
-            shared_klt=True,
+        cfg = _build_projector_rotation_cfg_from_mode(rotation_mode)
+        rotate_cobra_vlm_output_projector_from_path_inplace(
+            vlm,
+            klt_path=Path(SHARED_KLT_PATH),
+            cfg=cfg,
         )
-
-        module_path, lm_head = rotate_cobra_vlm_output_projector_from_path_inplace(
-            vlm=vlm,
-            klt_path=SHARED_KLT_PATH,
-            cfg=proj_rot_cfg,
-        )
-
         print(
-            "[load_quantized_cobra_vlm] Applied projector rotation on "
-            f"module_path={module_path}, lm_head_shape={tuple(lm_head.weight.shape)}"
-        )
-    else:
-        print(
-            "[load_quantized_cobra_vlm] Projector rotation skipped "
-            f"(mode={quant_cfg.mode.value}, use_rotation_for={sorted(quant_cfg.use_rotation_for)}, "
-            f"projector_rotation_mode={rotation_mode})"
+            "[load_quantized_cobra_vlm] Rotated output projector "
+            f"(mode={rotation_mode}, klt_path={SHARED_KLT_PATH}, use_klt={getattr(cfg, 'use_klt', None)}, "
+            f"use_hadamard={getattr(cfg, 'use_hadamard', None)})"
         )
 
     return vlm
-

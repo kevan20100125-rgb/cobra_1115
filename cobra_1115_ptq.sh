@@ -47,7 +47,7 @@ export HF_DATASETS_CACHE="${HF_DATASETS_CACHE:-${HF_HOME}}"
 MODE="${MODE:-full}"
 
 # BITS: 例如 W8A8 / W4A4 / W16A16（quant_calibrate 用）
-BITS="${BITS:-W4A4}"
+BITS="${BITS:-W8A16}"
 
 # SMOKE:
 #   1 -> smoke test（極少 batch 驗證流程）

@@ -60,6 +60,7 @@ _CANONICAL_TARGETS: Tuple[str, ...] = (
     "vision.siglip",
     "llm",
     "projector",
+    "fusion",
 )
 
 
@@ -476,4 +477,5 @@ def calibrate_model_from_stats(
     )
 
     return summary, hi_lo_map
+
 
