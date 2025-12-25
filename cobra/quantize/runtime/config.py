@@ -27,7 +27,7 @@ from enum import Enum, unique
 from typing import Optional, Iterable, Set, Tuple
 
 
-_CANONICAL_TARGETS = ("vision.dino", "vision.siglip", "llm", "projector")
+_CANONICAL_TARGETS = ("vision.dino", "vision.siglip", "llm", "projector", "fusion")
 _SUPPORTED_BITS = (2, 4, 8, 16)
 
 
@@ -229,9 +229,9 @@ class QuantRuntimeConfig:
         symmetric_acts: bool = True,
         symmetric_weights: bool = True,
         config_name: Optional[str] = None,
-        projector_rotation_mode: Optional[str] = "hk",
-        fusion_rotation_mode: Optional[str] = None,
-        absorb_fusion_rotation: bool = False,
+        projector_rotation_mode: Optional[str] = "none",
+        fusion_rotation_mode: Optional[str] = "hk",
+        absorb_fusion_rotation: bool = True,
     ) -> "QuantRuntimeConfig":
         """
         由 bits/backend（以及 enable_* 旗標）建構 QuantRuntimeConfig。
@@ -385,4 +385,5 @@ class QuantRuntimeConfig:
             ProjectorRotationMode.HK,
             ProjectorRotationMode.HADAMARD,
         )
+
 
