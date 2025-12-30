@@ -27,10 +27,15 @@ from cobra.quantize.quantizer import UniformAffineQuantizer
 # Target normalization
 # ---------------------------------------------------------------------------
 
-ALLOWED_TARGETS = {"vision.dino", "vision.siglip", "llm", "projector", "fusion"}
+ALLOWED_TARGETS = {"fusion", "vision.dino", "vision.siglip", "llm", "projector"}
 
 # Legacy / alias → canonical target mapping
 LEGACY_TARGET_MAP: Dict[str, str] = {
+    # Fusion stage (Point-B)
+    "fusion": "fusion",
+    "fusion_stage": "fusion",
+    "fusionstage": "fusion",
+
     # Older naming patterns (from previous prototypes / scripts)
     "vision_backbone.dino": "vision.dino",
     "vision_backbone.siglip": "vision.siglip",
@@ -44,17 +49,17 @@ LEGACY_TARGET_MAP: Dict[str, str] = {
     "encoder.out": "projector",
 }
 
-
 def normalize_target(name: str) -> str:
     """
-    Map various user / legacy target names to the canonical four-class vocabulary.
+    Map various user / legacy target names to the canonical vocabulary.
 
     Canonical targets:
+        - "fusion"
         - "vision.dino"
         - "vision.siglip"
         - "llm"
         - "projector"
-        - "fusion"
+
     Raises:
         KeyError: if the name cannot be normalized.
     """
@@ -75,11 +80,12 @@ def normalize_target(name: str) -> str:
     # exact legacy mapping
     if raw_stripped in LEGACY_TARGET_MAP:
         return LEGACY_TARGET_MAP[raw_stripped]
-
     if lowered in LEGACY_TARGET_MAP:
         return LEGACY_TARGET_MAP[lowered]
 
     # heuristic fallbacks based on substrings
+    if "fusion" in lowered:
+        return "fusion"
     if "dino" in lowered:
         return "vision.dino"
     if "siglip" in lowered:
@@ -90,7 +96,6 @@ def normalize_target(name: str) -> str:
         return "llm"
 
     raise KeyError(f"Unrecognized percentile target name: {name!r}")
-
 
 def normalize_stage(name: str) -> str:
     """
@@ -268,3 +273,4 @@ def compute_affine_params(
         zero_point = int(quant.round_zero_point.item())
 
     return scale, zero_point
+

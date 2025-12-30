@@ -56,18 +56,16 @@ overwatch = initialize_overwatch(__name__)
 
 # Canonical target vocabulary used throughout the PTQ stack.
 _CANONICAL_TARGETS: Tuple[str, ...] = (
+    "fusion",
     "vision.dino",
     "vision.siglip",
     "llm",
     "projector",
-    "fusion",
 )
-
 
 # ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
-
 
 def _infer_module_device(module: nn.Module) -> torch.device:
     """
@@ -296,7 +294,16 @@ def calibrate_model_from_hi_lo(
         total_records += 1
 
         target_raw = rec.get("target", "")
-        module_name = rec.get("module", "")
+        module_name = rec.get("module", None)
+
+        # Make missing/empty module field debuggable (avoid silent "" / confusing logs)
+        if module_name is None or (isinstance(module_name, str) and not module_name.strip()):
+            module_name = "<unknown>"
+            overwatch.warning(
+                f"[PctCalib] Record={record_key!r} has empty module field (target={target_raw!r}); "
+                "cannot match model.named_modules().",
+                extra={"record": record_key, "target": target_raw, "module": module_name},
+            )
         percent = float(rec.get("percent", 0.0))
         hi = float(rec.get("hi", 0.0))
         lo = float(rec.get("lo", 0.0))
@@ -325,8 +332,9 @@ def calibrate_model_from_hi_lo(
 
         if module_name not in name_to_module:
             overwatch.warning(
-                f"[PctCalib] Skip record={record_key!r}: module={module_name!r} not found in model",
-                extra={"target": target, "module": module_name},
+                f"[PctCalib] Skip record={record_key!r}: module={module_name!r} not found in model "
+                f"(target={target!r}).",
+                extra={"record": record_key, "target": target, "module": module_name},
             )
             continue
 
