@@ -88,7 +88,7 @@ overwatch = initialize_overwatch(__name__)
 #:   - `quant_finalize.py` (offline INT export),
 #:   - `runtime/load_quantized_vlm.py` (online fake/INT backends)
 #: all agree on the same convention.
-SHARED_KLT_PATH: Path = Path("outputs/quantize/shared_klt.pt")
+SHARED_KLT_PATH: Path = Path("/work/asdf1234/cobra_1115/outputs/quantize/shared_klt.pt")
 
 
 def load_klt_matrix(path: Optional[Path]) -> Optional[torch.Tensor]:
@@ -558,5 +558,4 @@ def rotate_cobra_vlm_output_projector_from_path_inplace(
         K=K,
         cfg=cfg,
     )
-
 
