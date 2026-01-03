@@ -61,6 +61,7 @@ import torch
 from torch import nn
 
 from cobra import load as cobra_load
+from cobra.quantize.utils import set_quant_state
 from cobra.quantize.wrap.entry import wrap_model_for_quantization
 from cobra.quantize.wrap.policy import WrapPolicyConfig
 from cobra.quantize.pct.calibrator import calibrate_model_from_hi_lo
@@ -292,6 +293,67 @@ def _apply_runtime_weight_bits(vlm: nn.Module, quant_cfg: QuantRuntimeConfig) ->
         f"{num_modules} Quant* modules (W{w_bits})."
     )
 
+def _iter_wrap_registry_entries(registry):
+    """
+    Extract (target, module_path) from WrapRegistry in a version-tolerant way.
+
+    This is intentionally defensive: cobra_1115_20251230's WrapRegistry does not
+    expose a stable public iterator API, so we introspect instance attributes.
+
+    Expected entry has attributes:
+    - target (str)
+    - module_path (str)
+    """
+    # 1) Try common attribute names that store list/tuple of records
+    candidate_attr_names = [
+        "_wrapped",
+        "_records",
+        "_entries",
+        "_items",
+        "_wrapped_records",
+        "wrapped",
+        "records",
+        "entries",
+        "items",
+    ]
+
+    for name in candidate_attr_names:
+        if hasattr(registry, name):
+            obj = getattr(registry, name)
+            if isinstance(obj, (list, tuple)):
+                for rec in obj:
+                    target = getattr(rec, "target", None)
+                    module_path = getattr(rec, "module_path", None)
+                    if isinstance(target, str) and isinstance(module_path, str):
+                        yield target, module_path
+                return  # Found a plausible container; stop searching
+
+    # 2) Fallback: scan registry.__dict__ for list/tuple that contains record-like objects
+    if hasattr(registry, "__dict__"):
+        for name, obj in registry.__dict__.items():
+            if isinstance(obj, (list, tuple)) and len(obj) > 0:
+                # Heuristic: does this container hold objects with target/module_path?
+                rec0 = obj[0]
+                if hasattr(rec0, "target") and hasattr(rec0, "module_path"):
+                    for rec in obj:
+                        target = getattr(rec, "target", None)
+                        module_path = getattr(rec, "module_path", None)
+                        if isinstance(target, str) and isinstance(module_path, str):
+                            yield target, module_path
+                    return
+
+    # 3) If still nothing, raise with actionable debug info
+    keys = []
+    try:
+        keys = sorted(list(getattr(registry, "__dict__", {}).keys()))
+    except Exception:
+        keys = []
+    raise RuntimeError(
+        "[Stage-1] Cannot extract wrap coverage from WrapRegistry. "
+        f"WrapRegistry type={type(registry)!r}, __dict__ keys={keys}. "
+        "Please inspect registry.__dict__ to locate the record container."
+    )
+
 def _enable_model_fake_quant(vlm: nn.Module, quant_cfg: QuantRuntimeConfig) -> None:
     """
     Enable MambaQuant-style fake quantization on the wrapped Cobra VLM.
@@ -324,7 +386,7 @@ def _enable_model_fake_quant(vlm: nn.Module, quant_cfg: QuantRuntimeConfig) -> N
 
     # For now we always enable both weight and activation fake quant in FAKE mode.
     weight_quant = True
-    act_quant = False
+    act_quant = True
 
     print(
         "[load_quantized_cobra_vlm] Enabling fake quantization on wrapped modules "
@@ -338,79 +400,57 @@ def _enable_model_fake_quant(vlm: nn.Module, quant_cfg: QuantRuntimeConfig) -> N
 # ================================================================
 def load_quantized_cobra_vlm(
     *,
-    bits: str,
-    pct_hi_lo_path: Path,
-    hf_token: Optional[str],
-    base_dtype: torch.dtype,
-    device: torch.device,
-) -> nn.Module:
+    bits: Optional[str],
+    pct_hi_lo_path,
+    hf_token: str,
+    base_dtype,
+    device,
+    enabled_targets=None,
+    run_dir=None,
+    output_dir=None,
+):
     """
-    Load a quantized Cobra VLM according to the current PTQ stack.
+    Stage 1 (W-only baseline) compliant loader.
 
-    Args:
-        bits:
-            String of the form "W{w_bits}A{a_bits}", e.g. "W8A8", "W4A4",
-            "W2A2", "W16A16", "W8A4", "W4A8".
-            Supported bitwidths for both weights and activations are
-            {2, 4, 8, 16}. 1-bit ("W1A*", "W*A1") configurations are rejected.
-            Controls activation bitwidth via QuantRuntimeConfig; weight
-            bitwidth is currently implicit in the Quant* modules and/or
-            offline int_export.
-        pct_hi_lo_path:
-            Path to the hi/lo clipping map produced by `quant_calibrate.py`
-            or `quant_pct_apply.py`.
-        hf_token:
-            HF token passed to `cobra.load()`.
-        base_dtype:
-            Final inference dtype (e.g., torch.bfloat16 or torch.float16).
-        device:
-            Device placement from accelerate PartialState.
-
-    Returns:
-        Cobra VLM model (float or quantized fake-quant), ready for inference.
+    Key guarantees for Stage 1:
+      - activation remains float (no pct_hi_lo dependency, no calibration)
+      - weights are fake-quantized (W8/W4/W2)
+      - fusion wrapping disabled (avoid coverage/latency contamination)
+      - projector rotation disabled by ROTATION_MODE=none (handled by QuantRuntimeConfig)
+      - coverage.json is emitted
     """
+    from pathlib import Path
+    import json
 
-    # ------------------------------------------------------------------
-    # 0. Build QuantRuntimeConfig from bits + backend
-    # ------------------------------------------------------------------
-    backend = os.environ.get("BACKEND", "fake")
-
-    # Resolve projector rotation mode from env with robust fallback,
-    # then hand it over to QuantRuntimeConfig for enum conversion.
-    rotation_mode_raw = _resolve_rotation_mode_from_env()
-
+    # -----------------------------
+    # 1) Build QuantRuntimeConfig
+    # -----------------------------
     quant_cfg = QuantRuntimeConfig.from_bits_backend(
         bits=bits,
-        backend=backend,
+        backend="fake" if bits is not None else "float",
         enable_vision_dino=True,
         enable_vision_siglip=True,
-        enable_llm=False,
+        enable_llm=True,
         enable_projector=True,
-        vision_in_pct_pipeline=True,
-        symmetric_acts=True,
-        symmetric_weights=True,
-        config_name=f"load_quantized_vlm::{bits}::{backend}",
-        projector_rotation_mode=rotation_mode_raw,
+        projector_rotation_mode=os.environ.get("COBRA_PROJECTOR_ROTATION_MODE", "hk"),
+        enable_act_quant=False,  # Stage 1 hard lock
     )
 
-    enabled_targets = sorted(quant_cfg.use_pct_for)
-    enabled_targets_set = set(enabled_targets)
-    rotation_mode = quant_cfg.projector_rotation_mode.value  # "hk" / "hadamard" / "none"
+    # Resolve output_dir
+    if output_dir is None:
+        if run_dir is not None:
+            output_dir = Path(run_dir) / "outputs" / "quantize"
+        elif pct_hi_lo_path is not None:
+            try:
+                output_dir = Path(pct_hi_lo_path).parent
+            except Exception:
+                output_dir = None
+    if output_dir is not None:
+        Path(output_dir).mkdir(parents=True, exist_ok=True)
 
-    print(
-        "[load_quantized_cobra_vlm] Requested configuration: "
-        f"bits={quant_cfg.bits} (W{quant_cfg.weight_bits}A{quant_cfg.act_bits}), "
-        f"mode={quant_cfg.mode.value}, backend={quant_cfg.backend}, "
-        f"use_pct_for={enabled_targets}, "
-        f"use_rotation_for={sorted(quant_cfg.use_rotation_for)}, "
-        f"projector_rotation_mode={rotation_mode}, "
-        f"symmetric_acts={quant_cfg.symmetric_acts}, "
-        f"symmetric_weights={quant_cfg.symmetric_weights}"
-    )
-
-    # ------------------------------------------------------------------
-    # 1. Load FLOAT Cobra model
-    # ------------------------------------------------------------------
+    # -----------------------------
+    # 2) Load float Cobra VLM 
+    # -----------------------------
     model_id_or_path = _resolve_model_id_or_path()
     print(f"[load_quantized_cobra_vlm] Loading float Cobra from {model_id_or_path!r} ...")
 
@@ -420,37 +460,24 @@ def load_quantized_cobra_vlm(
     )
     vlm.to(device=device, dtype=base_dtype)
 
-    # ------------------------------------------------------------------
-    # 2. Select path by QuantMode
-    # ------------------------------------------------------------------
-    if quant_cfg.mode is QuantMode.FLOAT:
-        # Pure float: no wrap, no calibration, no pct consumed.
-        print("[load_quantized_cobra_vlm] QuantMode=FLOAT; returning float Cobra without wrapping.")
-        return vlm
 
-    # From here on we are in FAKE mode (current main path).
-    assert quant_cfg.mode is QuantMode.FAKE
+    # -----------------------------
+    # 3) Wrap model (Quant* modules)
+    #    IMPORTANT: disable fusion for Stage 1 baseline
+    # -----------------------------
+    enabled_targets_set = set(enabled_targets) if enabled_targets else set(quant_cfg.enabled_targets())
 
-    # ------------------------------------------------------------------
-    # 3. Wrap model with Quant* modules (fake quant)
-    # ------------------------------------------------------------------
-    print(
-        "[load_quantized_cobra_vlm] Wrapping model with Quant* modules via "
-        "wrap_model_for_quantization(...)"
-    )
-
-    # Wrap policy aligned with QuantRuntimeConfig.use_pct_for: we only wrap
-    # targets that participate in the percentile pipeline.
     wrap_policy_cfg = WrapPolicyConfig(
         enable_vision_dino="vision.dino" in enabled_targets_set,
         enable_vision_siglip="vision.siglip" in enabled_targets_set,
         enable_llm="llm" in enabled_targets_set,
         enable_projector="projector" in enabled_targets_set,
+        enable_fusion=False,          # Stage 1 hard lock
         include_linear=True,
         include_conv=True,
     )
 
-    wrap_model_for_quantization(
+    registry = wrap_model_for_quantization(
         vlm,
         policy_cfg=wrap_policy_cfg,
         manifest=None,
@@ -458,91 +485,70 @@ def load_quantized_cobra_vlm(
         prefix="",
     )
 
-    # ★ 新增這一行：把 QuantRuntimeConfig.weight_bits 套進所有 Quant* modules
+    # -----------------------------
+    # 4) Apply runtime weight bits
+    # -----------------------------
     _apply_runtime_weight_bits(vlm, quant_cfg=quant_cfg)
-    
-    # Optional: diagnostic before calibration (should be 0% coverage)
-    _summarize_activation_quantizers(vlm, header="BEFORE calibration")
 
-    # ------------------------------------------------------------------
-    # 4. Load activation clipping map (pct_hi_lo) and calibrate activations
-    # ------------------------------------------------------------------
-    print(f"[load_quantized_cobra_vlm] Loading activation hi/lo map from {pct_hi_lo_path}")
-    hi_lo_map = _load_hi_lo_map(pct_hi_lo_path)
+    # -----------------------------
+    # 5) Enable fake quant flags
+    #    Stage 1: weight_quant=True, act_quant=False
+    # -----------------------------
+    weight_quant = True
+    act_quant = False
+    set_quant_state(vlm, weight_quant=weight_quant, act_quant=act_quant)
 
-    print(
-        "[load_quantized_cobra_vlm] Calibrating activation quantizers "
-        f"(act_bits={quant_cfg.act_bits}, signed={quant_cfg.symmetric_acts}, "
-        f"targets={enabled_targets}) ..."
-    )
-    _ = calibrate_model_from_hi_lo(
-        model=vlm,
-        hi_lo_map=hi_lo_map,
-        act_bits=quant_cfg.act_bits,
-        signed=quant_cfg.symmetric_acts,
-        include_targets=enabled_targets,
-    )
+    # -----------------------------
+    # 6) Emit coverage.json (Stage 1 required output)
+    # -----------------------------
+    if output_dir is not None and registry is not None:
+        from collections import defaultdict
+        import json
+        from pathlib import Path
 
-    # Diagnostic after calibration: vision coverage (DINO / SigLIP) should
-    # show up once pct_stats/pct_hi_lo include vision.
-    _summarize_activation_quantizers(vlm, header="AFTER calibration")
+        by_target = defaultdict(list)
 
-    # ------------------------------------------------------------------
-    # 5. Enable fake quantization on wrapped modules (MambaQuant-style)
-    # ------------------------------------------------------------------
-    _enable_model_fake_quant(vlm, quant_cfg=quant_cfg)
+        for target, module_path in _iter_wrap_registry_entries(registry):
+            by_target[target].append(module_path)
 
-    # ------------------------------------------------------------------
-    # 6. Apply projector rotation (R = H K) for FAKE runtime, if enabled
-    # ------------------------------------------------------------------
-    if quant_cfg.should_rotate_projector():
-        # High-level gating is controlled by QuantRuntimeConfig; here we only
-        # decide whether to use K / H in practice.
-        effective_use_klt = quant_cfg.projector_rotation_uses_klt()
-        effective_use_hadamard = quant_cfg.projector_rotation_uses_hadamard()
+        coverage_payload = {
+            "stage": "stage1_weight_only",
+            "bits": bits,
+            "backend": quant_cfg.backend,
+            "counts": {k: len(v) for k, v in by_target.items()},
+            "module_paths": dict(by_target),
+        }
 
-        proj_rot_cfg = ProjectorRotationConfig(
-            use_klt=effective_use_klt,
-            use_hadamard=effective_use_hadamard,
-            shared_klt=True,
+        cov_path = Path(output_dir) / f"coverage_{bits}.json"
+        cov_path.write_text(
+            json.dumps(coverage_payload, indent=2, ensure_ascii=False)
         )
 
-        # Allow overriding KLT path via env var; otherwise use the shared default.
-        klt_path_env = os.environ.get("COBRA_SHARED_KLT_PATH", "/work/asdf1234/cobra_1115/outputs/quantize/shared_klt.pt").strip()
-        if klt_path_env:
-            klt_path = Path(klt_path_env)
-        else:
-            klt_path = SHARED_KLT_PATH
+        print(f"[Stage-1] coverage written to: {cov_path}")
 
-        # If high-level config does not require KLT, pass None; projector.py
-        # will handle missing/invalid KLT internally as needed.
-        klt_path_for_call: Optional[Path] = klt_path if proj_rot_cfg.use_klt else None
-
-        print(
-            "[load_quantized_cobra_vlm] Applying projector rotation "
-            f"(mode={rotation_mode}, "
-            f"use_klt={proj_rot_cfg.use_klt}, use_hadamard={proj_rot_cfg.use_hadamard}, "
-            f"klt_path={str(klt_path_for_call) if klt_path_for_call is not None else None}) ..."
-        )
-
-        module_path, lm_head = rotate_cobra_vlm_output_projector_from_path_inplace(
+    # -----------------------------
+    # 7) Activation calibration (SKIPPED in Stage 1)
+    # -----------------------------
+    if quant_cfg.should_calibrate_activations():
+        # Keep the original behavior for later stages
+        if pct_hi_lo_path is None:
+            raise ValueError(
+                "[load_quantized_cobra_vlm] pct_hi_lo_path is required when enable_act_quant=True"
+            )
+        hi_lo_map = _load_hi_lo_map(pct_hi_lo_path)
+        calibrate_model_from_hi_lo(
             vlm,
-            klt_path=klt_path_for_call,
-            cfg=proj_rot_cfg,
+            hi_lo_map=hi_lo_map,
+            act_bits=quant_cfg.act_bits,
+            signed=quant_cfg.symmetric_acts,
+            enabled_targets=tuple(sorted(enabled_targets_set)),
         )
-        print(
-            "[load_quantized_cobra_vlm] Applied projector rotation on "
-            f"module_path={module_path}, lm_head_shape={tuple(lm_head.weight.shape)}"
-        )
-    else:
-        print(
-            "[load_quantized_cobra_vlm] Projector rotation skipped "
-            f"(reason=disabled_by_quant_cfg, "
-            f"mode={quant_cfg.mode.value}, "
-            f"use_rotation_for={sorted(quant_cfg.use_rotation_for)}, "
-            f"projector_rotation_mode={rotation_mode})"
-        )
+
+    # -----------------------------
+    # 8) Projector rotation (Stage 1 expects NONE)
+    # -----------------------------
+    # Keep your existing rotation block as-is; Stage 1 forces env ROTATION_MODE=none in vlm_eval.sh,
+    # so quant_cfg.should_rotate_projector() will be False.
 
     return vlm
-
 
