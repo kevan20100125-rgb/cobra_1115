@@ -5,12 +5,13 @@ runtime/config.py
 
 Centralized runtime quantization configuration for Cobra PTQ.
 
-Design goals:
+Design goal (Phase 2+):
     - All decisions about bits / backend / targets / modes should come from
       QuantRuntimeConfig, and only from here.
     - The following entrypoints must treat QuantRuntimeConfig as the single
       source of truth:
           * switches/quant_calibrate.py
+          * switches/quant_finalize.py
           * quantize/runtime/load_quantized_vlm.py
     - Scripts and CLIs should NOT re-parse bits or re-decide target sets
       on their own; instead they should:
@@ -27,7 +28,7 @@ from enum import Enum, unique
 from typing import Optional, Iterable, Set, Tuple
 
 
-_CANONICAL_TARGETS = ("vision.dino", "vision.siglip", "llm", "projector", "fusion")
+_CANONICAL_TARGETS = ("vision.dino", "vision.siglip", "llm", "projector")
 _SUPPORTED_BITS = (2, 4, 8, 16)
 
 
@@ -50,18 +51,6 @@ class ProjectorRotationMode(Enum):
     HADAMARD = "hadamard"
     NONE = "none"
 
-@unique
-class FusionRotationMode(Enum):
-    """
-    控制 Point B (fused_embeddings) 的旋轉模式。
-
-    - HK       : KLT + Hadamard  (R = H·K)
-    - HADAMARD : 只有 Hadamard
-    - NONE     : 不旋轉
-    """
-    HK = "hk"
-    HADAMARD = "hadamard"
-    NONE = "none"
 
 @dataclass
 class QuantRuntimeConfig:
@@ -86,12 +75,10 @@ class QuantRuntimeConfig:
 
     # projector rotation 模式（HK / HADAMARD / NONE）
     projector_rotation_mode: ProjectorRotationMode = ProjectorRotationMode.HK
-    fusion_rotation_mode: FusionRotationMode = FusionRotationMode.NONE
-    absorb_fusion_rotation: bool = False
-
 
     # 額外旗標
     vision_in_pct_pipeline: bool = True
+    enable_act_quant: bool = False
     symmetric_acts: bool = True
     symmetric_weights: bool = True
 
@@ -184,36 +171,6 @@ class QuantRuntimeConfig:
             "expected one of ['hk', 'hadamard', 'none'] (with a few aliases)."
         )
 
-    @staticmethod
-    def _parse_fusion_rotation_mode(
-        mode: Optional[str],
-    ) -> FusionRotationMode:
-        """
-        將使用者提供的 fusion rotation mode 字串（或 None）轉成 enum。
-
-        合法字串：
-            - "hk", "klt+hadamard", "klt_hadamard"
-            - "hadamard", "h"
-            - "none", "off", "disable", "disabled"
-
-        若為 None 或空字串，視為 "none"（預設不啟用 fusion rotation）。
-        """
-        if mode is None or not str(mode).strip():
-            return FusionRotationMode.NONE
-
-        s = str(mode).strip().lower()
-        if s in ("hk", "klt+hadamard", "klt_hadamard"):
-            return FusionRotationMode.HK
-        if s in ("hadamard", "h"):
-            return FusionRotationMode.HADAMARD
-        if s in ("none", "off", "disable", "disabled"):
-            return FusionRotationMode.NONE
-
-        raise ValueError(
-            f"[QuantRuntimeConfig] Unknown fusion_rotation_mode={mode!r}; "
-            "expected one of ['hk', 'hadamard', 'none'] (with a few aliases)."
-        )
-
     @classmethod
     def from_bits_backend(
         cls,
@@ -224,31 +181,25 @@ class QuantRuntimeConfig:
         enable_vision_siglip: bool = True,
         enable_llm: bool = True,
         enable_projector: bool = True,
-        enable_fusion: bool = True,
         vision_in_pct_pipeline: bool = True,
         symmetric_acts: bool = True,
         symmetric_weights: bool = True,
         config_name: Optional[str] = None,
-        projector_rotation_mode: Optional[str] = "none",
-        fusion_rotation_mode: Optional[str] = "hk",
-        absorb_fusion_rotation: bool = True,
+        projector_rotation_mode: Optional[str] = "hk",
+        enable_act_quant: bool = False,
     ) -> "QuantRuntimeConfig":
         """
-        由 bits/backend（以及 enable_* 旗標）建構 QuantRuntimeConfig。
+        Build QuantRuntimeConfig from bits/backend and switches.
 
-        backend:
-            - None / "float" -> FLOAT 模式（不 wrap / 不 pct / 不 finalize）
-            - "fake"         -> FAKE 模式（wrap + pct calibrate）
+        Stage 1 requirement:
+            - activation must remain float
+            - pct_hi_lo must NOT be required
+            - calibration must be skipped
 
-        bits:
-            - None 代表 float baseline
-            - "W4A4" / "W8A8" 等代表量化路徑
-
-        projector_rotation_mode:
-            - "hk"       : KLT + Hadamard
-            - "hadamard" : 只有 Hadamard
-            - "none"     : 完全不旋轉
-            若為 None，預設為 "hk"。
+        Control knob:
+            enable_act_quant:
+                - False => Stage 1 W-only (skip activation calibration)
+                - True  => later stages (allow calibration)
         """
         backend_norm = (backend or "float").lower()
         if backend_norm not in ("float", "fake"):
@@ -259,14 +210,13 @@ class QuantRuntimeConfig:
 
         w_bits, a_bits = cls._parse_bits(bits)
         proj_rot_mode_enum = cls._parse_projector_rotation_mode(projector_rotation_mode)
-        fusion_rot_mode_enum = cls._parse_fusion_rotation_mode(fusion_rotation_mode)
 
         if backend_norm == "float":
             mode = QuantMode.FLOAT
-        elif backend_norm == "fake":
+        else:
             mode = QuantMode.FAKE
 
-        # 哪些 target 要進 percentile / quant 流程
+        # Which targets enter quant pipeline (wrapping decision still uses this set)
         use_pct_for: Set[str] = set()
         if mode is not QuantMode.FLOAT:
             if enable_vision_dino:
@@ -277,19 +227,12 @@ class QuantRuntimeConfig:
                 use_pct_for.add("llm")
             if enable_projector:
                 use_pct_for.add("projector")
-            if enable_fusion:
-                use_pct_for.add("fusion")
 
-
-        # 若不希望 vision 進 pct pipeline，可以一口氣關掉
         if not vision_in_pct_pipeline:
             use_pct_for.discard("vision.dino")
             use_pct_for.discard("vision.siglip")
 
-        # rotation 通常只在 projector 上啟用：
-        #   - mode != FLOAT
-        #   - projector 本身有啟用
-        #   - projector_rotation_mode 不是 NONE
+        # Rotation gating (Stage 1 will set projector_rotation_mode="none" via script)
         use_rotation_for: Set[str] = set()
         if (
             mode is not QuantMode.FLOAT
@@ -311,9 +254,9 @@ class QuantRuntimeConfig:
             symmetric_weights=symmetric_weights,
             config_name=config_name,
             backend=backend_norm,
-            fusion_rotation_mode=fusion_rot_mode_enum,
-            absorb_fusion_rotation=absorb_fusion_rotation,
+            enable_act_quant=enable_act_quant,
         )
+
 
     # ------------------------------------------------------------------
     # Convenience helpers
@@ -349,20 +292,16 @@ class QuantRuntimeConfig:
             "projector" in self.use_rotation_for
             and self.projector_rotation_mode is not ProjectorRotationMode.NONE
         )
+    def should_calibrate_activations(self) -> bool:
+        """
+        Stage-gated activation calibration switch.
 
-    def should_rotate_fusion(self) -> bool:
-        return self.fusion_rotation_mode is not FusionRotationMode.NONE
+        Stage 1 (W-only baseline):
+            - enable_act_quant must be False
+            - calibration MUST be skipped
+        """
+        return (self.mode is not QuantMode.FLOAT) and bool(self.enable_act_quant)
 
-    def should_absorb_fusion_rotation(self) -> bool:
-        return bool(self.absorb_fusion_rotation) and self.should_rotate_fusion()
-    
-    def should_quantize_fusion(self) -> bool:
-        if self.mode is not QuantMode.FAKE:
-            return False
-        if self.act_bits is None or int(self.act_bits) >= 16:
-            return False
-        return "fusion" in self.use_pct_for
-    
     def projector_rotation_uses_klt(self) -> bool:
         """
         目前設定下，projector rotation 是否會使用 KLT。
@@ -385,5 +324,6 @@ class QuantRuntimeConfig:
             ProjectorRotationMode.HK,
             ProjectorRotationMode.HADAMARD,
         )
+
 
 
