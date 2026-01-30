@@ -6,8 +6,6 @@ cobra/py.typed
 cobra/conf/__init__.py
 cobra/conf/datasets.py
 cobra/conf/models.py
-cobra/integration/__init__.py
-cobra/integration/wrap_replace.py
 cobra/models/__init__.py
 cobra/models/load.py
 cobra/models/materialize.py
@@ -33,6 +31,7 @@ cobra/models/mamba/modeling_mamba.py
 cobra/models/vlms/__init__.py
 cobra/models/vlms/base_vlm.py
 cobra/models/vlms/cobra.py
+cobra/models/vlms/fusion.py
 cobra/overwatch/__init__.py
 cobra/overwatch/overwatch.py
 cobra/preprocessing/__init__.py
@@ -41,7 +40,6 @@ cobra/preprocessing/materialize.py
 cobra/preprocessing/datasets/__init__.py
 cobra/preprocessing/datasets/datasets.py
 cobra/quantize/__init__.py
-cobra/quantize/get_haar_matrix.py
 cobra/quantize/get_klt_matrix.py
 cobra/quantize/gptq.py
 cobra/quantize/hadamard_utils.py
@@ -54,7 +52,7 @@ cobra/quantize/int_others.py
 cobra/quantize/normalized_modules.py
 cobra/quantize/quantizer.py
 cobra/quantize/utils.py
-cobra/quantize/finalize/int_export.py
+cobra/quantize/wrap_replace.py
 cobra/quantize/observers/__init__.py
 cobra/quantize/observers/_hist_manager.py
 cobra/quantize/observers/_register.py
@@ -73,17 +71,20 @@ cobra/quantize/plot_utils/analyse_vim_plot.py
 cobra/quantize/plot_utils/utils.py
 cobra/quantize/rotate/hadamard.py
 cobra/quantize/rotate/klt.py
+cobra/quantize/rotate/mixer.py
 cobra/quantize/rotate/projector.py
+cobra/quantize/runtime/config.py
 cobra/quantize/runtime/load_quantized_vlm.py
+cobra/quantize/wrap/__init__.py
 cobra/quantize/wrap/entry.py
 cobra/quantize/wrap/manifest.py
 cobra/quantize/wrap/policy.py
 cobra/quantize/wrap/registry.py
 cobra/quantize/wrap/utils.py
+cobra/switches/quant_act_klt_outproj.py
 cobra/switches/quant_calibrate.py
-cobra/switches/quant_finalize.py
 cobra/switches/quant_klt.py
-cobra/switches/quant_pct_apply.py
+cobra/switches/verify_act_klt_outproj.py
 cobra/training/__init__.py
 cobra/training/materialize.py
 cobra/training/metrics.py

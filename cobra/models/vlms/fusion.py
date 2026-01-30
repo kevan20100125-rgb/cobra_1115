@@ -8,18 +8,10 @@ from cobra.quantize.quantizer import UniformAffineQuantizer
 
 class FusionStage(nn.Module):
     """
-    FusionStage (Point B)
+    FusionStage 
 
     This module is the explicit hook right after:
       concat([img_embeddings, text_embeddings]) -> fused_embeddings
-
-    Milestone 1 behavior:
-      - Identity (no-op).
-
-    Future milestones will extend this module to support:
-      - Global rotation: fused_embeddings := fused_embeddings @ R
-      - Global best clipping
-      - Global activation quant-dequant
     """
 
     def __init__(self) -> None:
@@ -70,18 +62,18 @@ class FusionStage(nn.Module):
                 x = torch.matmul(fused_embeddings, self.klt_matrix)
                 x = apply_hadamard_transform(x, dim=-1, normalize=True)
 
-        # Milestone 3: Global best clipping @ B (range comes from pct calibrator)
+        # Global best clipping @ B (range comes from pct calibrator)
         if getattr(self, "_has_clip_range", False):
             xmin = getattr(self.act_quantizer, "clip_min", None)
             xmax = getattr(self.act_quantizer, "clip_max", None)
             if isinstance(xmin, torch.Tensor) and isinstance(xmax, torch.Tensor) and xmin.numel() > 0 and xmax.numel() > 0:
                 lo = xmin.to(device=x.device, dtype=x.dtype)
                 hi = xmax.to(device=x.device, dtype=x.dtype)
-                # If quant is disabled, we still need pure clipping behavior (Milestone 3)
+                # If quant is disabled, we still need pure clipping behavior
                 if not getattr(self, "_enable_quant", False):
                     x = x.clamp(lo, hi)
 
-        # Milestone 4: Global low-bit mapping @ B (quant/dequant)
+        # Global low-bit mapping @ B (quant/dequant)
         if getattr(self, "_enable_quant", False):
             x = self.act_quantizer(x)
 
@@ -123,3 +115,4 @@ class FusionStage(nn.Module):
 
     def mark_clipping_ready(self) -> None:
         self._has_clip_range = True
+

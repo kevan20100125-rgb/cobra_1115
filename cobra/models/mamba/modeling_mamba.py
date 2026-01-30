@@ -324,8 +324,36 @@ def create_block(
     device=None,
     dtype=None,
 ):
+    """
+    Create a Mamba Block.
+
+    NOTE (Cobra PTQ / act-KLT export):
+      Mamba's fast path can bypass nn.Linear module calls (e.g., mixer.out_proj),
+      which prevents forward_pre_hook on out_proj from firing. For act-KLT export,
+      we need the module call path to collect activations.
+
+      We therefore allow forcing slow path via env:
+        - COBRA_DISABLE_MAMBA_FAST_PATH=1/true/yes/on
+        - COBRA_ACT_KLT_EXPORT=1/true/yes/on
+
+      This override is intended ONLY for calibration/export workflows.
+    """
+    import os
+
     if ssm_cfg is None:
         ssm_cfg = {}
+
+    # Force slow path when exporting act-KLT so that mixer.out_proj(...) is actually invoked.
+    flag_disable_fast = os.environ.get("COBRA_DISABLE_MAMBA_FAST_PATH", "").strip().lower() in (
+        "1", "true", "yes", "on"
+    )
+    flag_act_klt = os.environ.get("COBRA_ACT_KLT_EXPORT", "").strip().lower() in (
+        "1", "true", "yes", "on"
+    )
+    if flag_disable_fast or flag_act_klt:
+        ssm_cfg = dict(ssm_cfg)  # avoid mutating config dict shared across instances
+        ssm_cfg["use_fast_path"] = False
+
     factory_kwargs = {"device": device, "dtype": dtype}
     mixer_cls = partial(Mamba, layer_idx=layer_idx, **ssm_cfg, **factory_kwargs)
     norm_cls = partial(
@@ -558,3 +586,4 @@ class MambaForCausalLM(MambaPreTrainedModel, GenerationMixin):
 
 AutoConfig.register("mamba", MambaConfig)
 AutoModelForCausalLM.register(MambaConfig, MambaForCausalLM)
+

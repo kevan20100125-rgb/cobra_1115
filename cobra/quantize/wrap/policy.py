@@ -69,8 +69,6 @@ _CANONICAL_TARGETS = (
 # Config
 # ============================================================================
 
-
-@dataclass
 @dataclass
 class WrapPolicyConfig:
     """

@@ -38,13 +38,14 @@ export TRANSFORMERS_CACHE="${TRANSFORMERS_CACHE:-${HF_HOME}}"
 export HF_DATASETS_CACHE="${HF_DATASETS_CACHE:-${HF_HOME}}"
 
 # ==============================
-# 3. 入口參數（只保留 klt / calibrate）
+# 3. 入口參數
 # ==============================
 # MODE:
-#   klt       -> 只跑 quant_klt（產生 shared_klt.pt）
-#   calibrate -> 只跑 quant_calibrate（產生 pct_stats / pct_hi_lo / summary）
-#   full      -> calibrate + klt
-MODE="${MODE:-full}"
+#   klt        -> 只跑 quant_klt（產生 shared_klt.pt）
+#   calibrate  -> 只跑 quant_calibrate（產生 pct_stats / pct_hi_lo / summary）
+#   full       -> calibrate + klt
+#   act_klt    -> 只跑 quant_act_klt_outproj（產生 layer-wise act-KLT for out_proj）
+MODE="${MODE:-act_klt}"
 
 # BITS: 例如 W8A8 / W4A4 / W16A16（quant_calibrate 用）
 BITS="${BITS:-W8A8}"
@@ -64,24 +65,36 @@ case "${BACKEND}" in
     ;;
 esac
 
-# quant_klt stage（QuantKLTConfig 預設 finetune；可覆寫）
+# stage（QuantKLTConfig / QuantActKLTOutProjConfig）
 STAGE="${STAGE:-finetune}"
 
-# HF token（quant_klt 會用到；QuantKLTConfig 預設 .hf_token）
+# HF token（quant_klt / act_klt 會用到）
 HF_TOKEN_PATH="${HF_TOKEN_PATH:-${COBRA_1115_ROOT}/.hf_token}"
 
 mkdir -p outputs/slurm outputs/quantize
 
 # ==============================
-# 4. 輸出路徑（僅保留 pct 與 klt）
+# 4. 輸出路徑
 # ==============================
 PCT_STATS="${PCT_STATS:-outputs/quantize/pct_stats_${BITS}.pt}"
 PCT_HI_LO="${PCT_HI_LO:-outputs/quantize/pct_hi_lo_${BITS}.pt}"
 PCT_SUMMARY="${PCT_SUMMARY:-outputs/quantize/pct_calibrate_summary_${BITS}.json}"
 
-# shared KLT（QuantKLTConfig 預設是 cobra.quantize.rotate.projector.SHARED_KLT_PATH）
-# 這裡提供可覆寫的統一出口，避免硬編碼絕對路徑卡住不同機器
+# shared KLT
 KLT_OUT="${KLT_OUT:-outputs/quantize/shared_klt.pt}"
+
+# act-KLT (out_proj, layer-wise)
+ACT_KLT_OUT_IN="${ACT_KLT_OUT_IN:-outputs/quantize/act_klt_outproj_in_bs512/act_klt_outproj_in.pt}"
+ACT_KLT_OUT_OUT="${ACT_KLT_OUT_OUT:-outputs/quantize/act_klt_outproj_out_bs512/act_klt_outproj_out.pt}"
+ACT_KLT_EXPORT_OUT_FEATURE="${ACT_KLT_EXPORT_OUT_FEATURE:-1}"   # 1=同時輸出 out-feature K
+
+ACT_KLT_BLOCK_SIZE="${ACT_KLT_BLOCK_SIZE:-512}"
+ACT_KLT_MAX_BATCHES="${ACT_KLT_MAX_BATCHES:-0}"
+ACT_KLT_MAX_TOKENS="${ACT_KLT_MAX_TOKENS:-128}"
+COBRA_ACT_KLT_EXPORT="${COBRA_ACT_KLT_EXPORT:-1}"
+
+# ==============================
+# 5. Export env vars
 # ==============================
 export MODE
 export BITS
@@ -93,6 +106,26 @@ export PCT_STATS
 export PCT_HI_LO
 export PCT_SUMMARY
 export KLT_OUT
+
+export ACT_KLT_OUT_IN
+export ACT_KLT_OUT_OUT
+export ACT_KLT_EXPORT_OUT_FEATURE
+
+export ACT_KLT_BLOCK_SIZE
+export ACT_KLT_MAX_BATCHES
+export ACT_KLT_MAX_TOKENS
+
+# IMPORTANT:
+# Mamba fast path can bypass out_proj module calls, preventing forward_pre_hook collection.
+# For MODE=act_klt, force slow path via COBRA_ACT_KLT_EXPORT=1 unless user explicitly overrides.
+if [[ "${MODE}" == "act_klt" ]]; then
+  export COBRA_ACT_KLT_EXPORT="${COBRA_ACT_KLT_EXPORT:-1}"
+else
+  export COBRA_ACT_KLT_EXPORT="${COBRA_ACT_KLT_EXPORT:-0}"
+fi
+
+# ==============================
+# 6. Print
 # ==============================
 echo "[INFO] COBRA_1115_ROOT=${COBRA_1115_ROOT}"
 echo "[INFO] MODE=${MODE}, BITS=${BITS}, BACKEND=${BACKEND}, SMOKE=${SMOKE}, STAGE=${STAGE}"
@@ -100,10 +133,14 @@ echo "[INFO] PCT_STATS=${PCT_STATS}"
 echo "[INFO] PCT_HI_LO=${PCT_HI_LO}"
 echo "[INFO] PCT_SUMMARY=${PCT_SUMMARY}"
 echo "[INFO] KLT_OUT=${KLT_OUT}"
+echo "[INFO] ACT_KLT_OUT_IN=${ACT_KLT_OUT_IN}"
+echo "[INFO] ACT_KLT_OUT_OUT=${ACT_KLT_OUT_OUT}"
+echo "[INFO] ACT_KLT_BLOCK_SIZE=${ACT_KLT_BLOCK_SIZE}, ACT_KLT_MAX_BATCHES=${ACT_KLT_MAX_BATCHES}, ACT_KLT_MAX_TOKENS=${ACT_KLT_MAX_TOKENS}"
 echo "[INFO] HF_TOKEN_PATH=${HF_TOKEN_PATH}"
+echo "[INFO] COBRA_ACT_KLT_EXPORT=${COBRA_ACT_KLT_EXPORT}"
 
 # ==============================
-# 5. KLT（quant_klt）
+# 7. KLT（quant_klt）
 # ==============================
 if [[ "${MODE}" == "klt" || "${MODE}" == "full" ]]; then
   echo "[STEP] Running cobra_1115 quant_klt ..."
@@ -135,7 +172,7 @@ __PY__
 fi
 
 # ==============================
-# 6. Calibration（quant_calibrate）
+# 8. Calibration（quant_calibrate）
 # ==============================
 if [[ "${MODE}" == "calibrate" || "${MODE}" == "full" ]]; then
   echo "[STEP] Running cobra_1115 quant_calibrate ..."
@@ -193,6 +230,52 @@ quant_calibrate(cfg)
 __PY__
 
   echo "[STEP] Calibration finished."
+fi
+
+# ==============================
+# 9. act-KLT（quant_act_klt_outproj）
+# ==============================
+if [[ "${MODE}" == "act_klt" ]]; then
+  echo "[STEP] Running cobra_1115 quant_act_klt_outproj (layer-wise) ..."
+
+  python - << '__PY__'
+import os
+from pathlib import Path
+
+from cobra.switches.quant_act_klt_outproj import QuantActKLTOutProjConfig, quant_act_klt_outproj
+
+STAGE = os.environ.get("STAGE", "finetune")
+HF_TOKEN_PATH = Path(os.environ.get("HF_TOKEN_PATH", ".hf_token"))
+
+ACT_KLT_OUT_IN = Path(os.environ.get("ACT_KLT_OUT_IN", "outputs/quantize/act_klt_outproj_in_bs512/act_klt_outproj_in.pt"))
+ACT_KLT_OUT_OUT = Path(os.environ.get("ACT_KLT_OUT_OUT", "outputs/quantize/act_klt_outproj_out_bs512/act_klt_outproj_out.pt"))
+EXPORT_OUT = int(os.environ.get("ACT_KLT_EXPORT_OUT_FEATURE", "1")) != 0
+
+BLOCK_SIZE = int(os.environ.get("ACT_KLT_BLOCK_SIZE", "512"))
+MAX_BATCHES = int(os.environ.get("ACT_KLT_MAX_BATCHES", "0"))
+MAX_TOKENS = int(os.environ.get("ACT_KLT_MAX_TOKENS", "128"))
+
+cfg = QuantActKLTOutProjConfig(
+    stage=STAGE,
+    hf_token=HF_TOKEN_PATH,
+    device="cuda",
+    block_size=BLOCK_SIZE,
+    max_calib_batches=MAX_BATCHES,
+    max_tokens_per_sample=MAX_TOKENS,
+    act_klt_in_out=ACT_KLT_OUT_IN,
+    export_out_feature=EXPORT_OUT,
+    act_klt_out_out=ACT_KLT_OUT_OUT,
+)
+
+print(
+    f"[QuantActKLTOutProj] Running with stage={cfg.stage}, device={cfg.device}, dataset={cfg.dataset.dataset_id}, "
+    f"block_size={cfg.block_size}, max_batches={cfg.max_calib_batches}, max_tokens={cfg.max_tokens_per_sample}, "
+    f"act_klt_in_out={cfg.act_klt_in_out}, act_klt_out_out={cfg.act_klt_out_out}"
+)
+quant_act_klt_outproj(cfg)
+__PY__
+
+  echo "[STEP] act-KLT finished. Saved -> ${ACT_KLT_OUT_IN} , ${ACT_KLT_OUT_OUT}"
 fi
 
 echo "[DONE] cobra_1115 PTQ script complete (MODE=${MODE}, BITS=${BITS}, SMOKE=${SMOKE})."
