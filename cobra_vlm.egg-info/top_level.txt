@@ -1,5 +1,4 @@
 assets
 cobra
-data
 outputs
 scripts
