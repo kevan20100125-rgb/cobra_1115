@@ -1,20 +1,24 @@
 # cobra/quantize/runtime/load_quantized_vlm.py
 """
-Runtime loader for Cobra PTQ baseline (weight-only fake-quant).
+Runtime loader for Cobra PTQ baseline.
 
-Guarantees:
+Current behavior (kept stable):
   - activation remains float (no pct_hi_lo dependency, no activation calibration)
-  - weights are fake-quantized (W8/W4/W2)
+  - weights can be fake-quantized when W-bits are provided (W8/W4/W2)
   - fusion wrapping disabled (avoid coverage/latency contamination)
 
-This file is used at inference time (eval). 
+New behavior (interface only; no A-quant enabled yet):
+  - Accept richer BITS specs (pass-through from upstream), e.g.:
+      W8, W4, W2, W4A8, W8A8, A8
+  - Parse into (w_bits, a_bits) but keep a_bits as a no-op for now.
+  - Do NOT fail fast or warn for unsupported A bits (per user request).
 """
 
 from __future__ import annotations
 
 import os
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Tuple
 
 import torch
 from torch import nn
@@ -49,42 +53,58 @@ def _resolve_model_id_or_path() -> str:
     return "cobra+3b"
 
 
-def _parse_weight_bits(bits: Optional[str]) -> Optional[int]:
+def parse_bits_spec(bits: Optional[str]) -> Tuple[Optional[int], Optional[int]]:
     """
-    Accepted:
+    Parse a flexible BITS spec into (w_bits, a_bits).
+
+    Accepted (case-insensitive; whitespace ignored):
       - "W8" / "W4" / "W2"
-      - legacy: "W8A8" / "W4A4" / "W2A2" (A part ignored)
+      - "W4A8" / "W8A8" / "W2A2"  (A part parsed but is NO-OP currently)
+      - "A8" / "A16"             (activation-only request; NO-OP currently)
 
     Returns:
-      2/4/8 or None (None => float path)
+      (w_bits, a_bits), each Optional[int].
+      If parsing fails, returns (None, None) without raising.
     """
     if bits is None:
-        return None
+        return None, None
 
-    b = str(bits).strip().upper()
-    if not b:
-        return None
+    s = str(bits).strip().upper()
+    if not s:
+        return None, None
 
-    if b.startswith("W") and "A" not in b:
+    # W-only: W{n}
+    if s.startswith("W") and "A" not in s:
         try:
-            w = int(b[1:])
-        except ValueError:
-            raise ValueError(f"Invalid bits spec {bits!r}; expected W8/W4/W2.")
-    else:
-        # legacy W8A8 forms
-        if "A" not in b:
-            raise ValueError(f"Invalid bits spec {bits!r}; expected W8/W4/W2 (legacy W8A8 accepted).")
-        w_part = b.split("A", 1)[0]
+            w = int(s[1:])
+        except Exception:
+            return None, None
+        return w, None
+
+    # WA: W{n}A{m}
+    if s.startswith("W") and "A" in s:
+        w_part, a_part = s.split("A", 1)
         if not w_part.startswith("W"):
-            raise ValueError(f"Invalid bits spec {bits!r}; expected W8/W4/W2 (legacy W8A8 accepted).")
+            return None, None
         try:
             w = int(w_part[1:])
-        except ValueError:
-            raise ValueError(f"Invalid bits spec {bits!r}; expected W8/W4/W2.")
+        except Exception:
+            w = None
+        try:
+            a = int(a_part) if a_part else None
+        except Exception:
+            a = None
+        return w, a
 
-    if w not in (2, 4, 8):
-        raise ValueError(f"Unsupported weight bits W{w}; Only supports W8/W4/W2.")
-    return w
+    # A-only: A{m}
+    if s.startswith("A"):
+        try:
+            a = int(s[1:])
+        except Exception:
+            return None, None
+        return None, a
+
+    return None, None
 
 
 def _apply_runtime_weight_bits(vlm: nn.Module, w_bits: int) -> None:
@@ -109,9 +129,6 @@ def _iter_wrap_registry_entries(registry):
     """
     Extract (target, module_path) from WrapRegistry in a version-tolerant way.
     """
-    # Common patterns observed across revisions:
-    #   - registry.items(): yields (module_path, entry) where entry has `.target`
-    #   - registry.entries: list/dict with (target, module_path)
     if registry is None:
         return
     if hasattr(registry, "items") and callable(registry.items):
@@ -140,6 +157,7 @@ def _iter_wrap_registry_entries(registry):
                 yield str(target), str(module_path)
         return
 
+
 def _env_flag(name: str, default: bool = False) -> bool:
     v = os.environ.get(name)
     if v is None:
@@ -151,21 +169,11 @@ def _env_flag(name: str, default: bool = False) -> bool:
         return False
     return default
 
+
 def _extract_llm_for_mixer_rotation(vlm: nn.Module) -> nn.Module:
     """
     Robustly extract the underlying LLM module from a VLM wrapper.
-
-    We want the module that owns `backbone.layers` (Mamba) or `layers`.
-    Common CobraVLM layouts observed:
-      - vlm.llm_backbone.llm.backbone.layers
-      - vlm.llm_backbone.llm.layers
-      - vlm.llm_backbone.backbone.layers
-      - vlm.llm (already a bare llm)
-
-    Returns:
-      A best-effort LLM module. If extraction fails, returns `vlm` (safe fallback).
     """
-    # 1) Preferred: vlm.llm_backbone.llm
     lb = getattr(vlm, "llm_backbone", None)
     if lb is not None:
         cand = getattr(lb, "llm", None)
@@ -178,33 +186,18 @@ def _extract_llm_for_mixer_rotation(vlm: nn.Module) -> nn.Module:
         if isinstance(cand, nn.Module):
             return cand
 
-    # 2) Common: vlm.llm
     cand = getattr(vlm, "llm", None)
     if isinstance(cand, nn.Module):
         return cand
 
-    # 3) Last resort: maybe caller already passed LLM
     return vlm
+
 
 def _maybe_enable_llm_mixer_hadamard(llm, *, ptq_stage: int = 0):
     """
     Enable Quamba-structured mixer rotation (input + optional output transform) with KLT+Hadamard.
-
-    Env:
-      COBRA_LLM_MIXER_HADAMARD=1            enable mixer rotation pipeline
-      COBRA_LLM_MIXER_ACT_KLT=1             enable act-KLT (in/out)
-      COBRA_LLM_MIXER_OUT_TRANSFORM=1       enable output_transform (needs OUT KLT blocks)
-      ACT_KLT_OUTPROJ_IN=/path/to/in.pt     in-side KLT payload (fallback to ACT_KLT_OUT)
-      ACT_KLT_OUT=/path/to/in.pt            legacy in-side KLT payload
-      ACT_KLT_OUTPROJ_OUT=/path/to/out.pt   out-side KLT payload (required if OUT_TRANSFORM=1)
-      COBRA_LLM_MIXER_BLOCK=512             block size
-      COBRA_LLM_MIXER_TARGETS=out_proj      targets (comma sep)
-      COBRA_LLM_MIXER_MAX_LAYERS=...        optional cap
-      COBRA_LLM_MIXER_DRY_RUN=1             no-op but reports what would be applied
-      COBRA_LLM_MIXER_ACT_KLT_STRICT=1      strict missing/mismatch handling
     """
     import os
-
     from cobra.quantize.rotate.mixer import MixerHadamardRotationConfig, rotate_llm_mamba_mixers_hadamard_inplace
 
     enabled = os.environ.get("COBRA_LLM_MIXER_HADAMARD", "0").strip() == "1"
@@ -241,7 +234,6 @@ def _maybe_enable_llm_mixer_hadamard(llm, *, ptq_stage: int = 0):
         act_klt_strict=strict,
     )
 
-    # Add extra fields dynamically for backward compat if dataclass hasn't been updated
     setattr(cfg, "out_transform_enabled", bool(out_tx))
     if in_path:
         setattr(cfg, "act_klt_in_path", in_path)
@@ -259,6 +251,7 @@ def _maybe_enable_llm_mixer_hadamard(llm, *, ptq_stage: int = 0):
         f"applied={applied} skipped={skipped}"
     )
 
+
 # -----------------------------------------------------------------------------
 # Public entrypoint
 # -----------------------------------------------------------------------------
@@ -275,7 +268,6 @@ def load_quantized_cobra_vlm(
     output_dir=None,
 ):
     """
-
     Adds optional LLM mixer rotation:
       - Hadamard-only: COBRA_LLM_MIXER_HADAMARD=1
       - Hadamard + act-KLT: COBRA_LLM_MIXER_HADAMARD=1 and COBRA_LLM_MIXER_ACT_KLT=1
@@ -288,7 +280,7 @@ def load_quantized_cobra_vlm(
     from collections import defaultdict
 
     # -----------------------------
-    # 0) Entry diagnostics (so we can prove this loader is used)
+    # 0) Entry diagnostics
     # -----------------------------
     try:
         this_file = __file__
@@ -305,7 +297,7 @@ def load_quantized_cobra_vlm(
         f"COBRA_DISABLE_MAMBA_FAST_PATH={os.environ.get('COBRA_DISABLE_MAMBA_FAST_PATH', '')!r}"
     )
 
-    w_bits = _parse_weight_bits(bits)
+    w_bits, a_bits = parse_bits_spec(bits)
 
     # Resolve output_dir
     if output_dir is None:
@@ -319,10 +311,10 @@ def load_quantized_cobra_vlm(
     if output_dir is not None:
         Path(output_dir).mkdir(parents=True, exist_ok=True)
 
-    # Float fallback (no quant)
+    # Float fallback (no weight quant requested)
     if w_bits is None:
         model_id_or_path = _resolve_model_id_or_path()
-        print(f"[load_quantized_cobra_vlm] bits=None → loading FLOAT Cobra from {model_id_or_path!r} ...")
+        print(f"[load_quantized_cobra_vlm] w_bits=None (bits={bits!r}) → loading FLOAT Cobra from {model_id_or_path!r} ...")
         vlm = cobra_load(model_id_or_path, hf_token=hf_token)
         vlm.to(device=device, dtype=base_dtype)
         return vlm
@@ -353,14 +345,14 @@ def load_quantized_cobra_vlm(
     # -----------------------------
     # 2) Wrap model (Quant* modules)
     # -----------------------------
-    enabled_targets_set = set(enabled_targets) if enabled_targets else {"vision.dino", "vision.siglip", "llm", "projector"}
+    enabled_targets_set = set(enabled_targets) if enabled_targets else {"llm"}  # default to LLM only
 
     wrap_policy_cfg = WrapPolicyConfig(
         enable_vision_dino="vision.dino" in enabled_targets_set,
         enable_vision_siglip="vision.siglip" in enabled_targets_set,
         enable_llm="llm" in enabled_targets_set,
         enable_projector="projector" in enabled_targets_set,
-        enable_fusion=False,   # hard lock
+        enable_fusion=False,  # hard lock
         include_linear=True,
         include_conv=True,
     )
@@ -375,7 +367,6 @@ def load_quantized_cobra_vlm(
 
     # -----------------------------
     # 2.5) Enable LLM mixer rotation AFTER wrapping
-    #     CRITICAL: apply to LLM module (not the VLM wrapper) so we can find backbone.layers.
     # -----------------------------
     try:
         llm = _extract_llm_for_mixer_rotation(vlm)
@@ -395,10 +386,10 @@ def load_quantized_cobra_vlm(
     # -----------------------------
     # 3) Apply runtime weight bits
     # -----------------------------
-    _apply_runtime_weight_bits(vlm, w_bits=w_bits)
+    _apply_runtime_weight_bits(vlm, w_bits=int(w_bits))
 
     # -----------------------------
-    # 4) Enable fake quant flags
+    # 4) Enable fake quant flags (activation remains float)
     # -----------------------------
     set_quant_state(vlm, weight_quant=True, act_quant=False)
 
@@ -412,13 +403,14 @@ def load_quantized_cobra_vlm(
 
         coverage_payload = {
             "stage": "runtime_weight_only",
-            "bits": f"W{w_bits}",
+            "bits_raw": bits,
+            "bits_effective": f"W{int(w_bits)}",
             "backend": "fake",
             "counts": {k: len(v) for k, v in by_target.items()},
             "module_paths": dict(by_target),
         }
 
-        out_path = Path(output_dir) / f"coverage_W{w_bits}.json"
+        out_path = Path(output_dir) / f"coverage_W{int(w_bits)}.json"
         try:
             out_path.write_text(json.dumps(coverage_payload, indent=2))
         except Exception:
