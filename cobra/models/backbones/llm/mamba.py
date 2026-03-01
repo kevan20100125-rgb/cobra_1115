@@ -110,3 +110,9 @@ class MambaLLMBackbone(HFCausalLLMBackbone):
     def half_precision_dtype(self) -> torch.dtype:
         """Mamba was trained in AMP with BF16; see https://github.com/state-spaces/mamba/issues/6."""
         return torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+
+    @property
+    def embed_dim(self) -> int:
+        # HF Mamba configs can expose a stale `hidden_size` (e.g., 768) while
+        # the actual mixer width is stored in `d_model` (e.g., 2560 for 2.8B).
+        return int(getattr(self.llm.config, "d_model", self.llm.config.hidden_size))

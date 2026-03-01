@@ -5,6 +5,7 @@
 # Based on various files from https://github.com/state-spaces/mamba
 
 import math
+import os
 from functools import partial
 from typing import Optional, Tuple
 
@@ -17,7 +18,11 @@ from torch.nn import CrossEntropyLoss
 # TODO: add new (optional?) dependencies to transformers
 from einops import rearrange, repeat
 from mamba_ssm.models.mixer_seq_simple import _init_weights
-from mamba_ssm.modules.mamba_simple import Mamba
+try:
+    from mamba_ssm.modules.mamba_simple import Mamba as _VanillaMamba
+except ImportError:
+    _VanillaMamba = None
+from .mamba_cfzo import Mamba as _CFZOMamba
 from mamba_ssm.utils.generation import InferenceParams
 from mamba_ssm.utils.generation import sample, update_graph_cache, modify_logit_for_repetition_penalty
 from mamba_ssm.ops.selective_scan_interface import selective_scan_fn, mamba_inner_fn
@@ -37,7 +42,24 @@ except ImportError:
 try:
     from mamba_ssm.ops.triton.layernorm import RMSNorm, layer_norm_fn, rms_norm_fn
 except ImportError:
-    RMSNorm, layer_norm_fn, rms_norm_fn = None, None, None
+    layer_norm_fn, rms_norm_fn = None, None
+
+    class RMSNorm(nn.Module):
+        def __init__(self, hidden_size, eps=1e-5, device=None, dtype=None):
+            super().__init__()
+            self.weight = nn.Parameter(torch.ones(hidden_size, device=device, dtype=dtype))
+            self.eps = eps
+
+        def forward(self, hidden_states: Tensor) -> Tensor:
+            input_dtype = hidden_states.dtype
+            hidden_states_fp32 = hidden_states.to(torch.float32)
+            variance = hidden_states_fp32.pow(2).mean(dim=-1, keepdim=True)
+            hidden_states = hidden_states_fp32 * torch.rsqrt(variance + self.eps)
+            return (hidden_states.to(self.weight.dtype) * self.weight).to(input_dtype)
+
+
+_USE_CFZO_MAMBA = os.environ.get("COBRA_USE_CFZO_MAMBA", "0").strip() == "1"
+Mamba = _CFZOMamba if (_USE_CFZO_MAMBA or _VanillaMamba is None) else _VanillaMamba
 
 
 from transformers import AutoConfig, AutoModelForCausalLM
@@ -96,6 +118,10 @@ def decode(
         sequences: (batch, max_length)
         scores: tuples of (batch, vocab_size)
     """
+    # CUDA graph cache path can conflict with CF-ZO safety checks in custom Mamba blocks.
+    if use_cache and os.environ.get("COBRA_DISABLE_MAMBA_GRAPH_CACHE", "1").strip() == "1":
+        use_cache = False
+
     if streamer is not None:
         streamer.put(input_ids.cpu())
 
@@ -324,41 +350,16 @@ def create_block(
     device=None,
     dtype=None,
 ):
-    """
-    Create a Mamba Block.
-
-    NOTE (Cobra PTQ / act-KLT export):
-      Mamba's fast path can bypass nn.Linear module calls (e.g., mixer.out_proj),
-      which prevents forward_pre_hook on out_proj from firing. For act-KLT export,
-      we need the module call path to collect activations.
-
-      We therefore allow forcing slow path via env:
-        - COBRA_DISABLE_MAMBA_FAST_PATH=1/true/yes/on
-        - COBRA_ACT_KLT_EXPORT=1/true/yes/on
-
-      This override is intended ONLY for calibration/export workflows.
-    """
-    import os
-
     if ssm_cfg is None:
         ssm_cfg = {}
 
-    # Force slow path when exporting act-KLT so that mixer.out_proj(...) is actually invoked.
-    flag_disable_fast = os.environ.get("COBRA_DISABLE_MAMBA_FAST_PATH", "").strip().lower() in (
-        "1", "true", "yes", "on"
-    )
-    flag_act_klt = os.environ.get("COBRA_ACT_KLT_EXPORT", "").strip().lower() in (
-        "1", "true", "yes", "on"
-    )
-    if flag_disable_fast or flag_act_klt:
-        ssm_cfg = dict(ssm_cfg)  # avoid mutating config dict shared across instances
-        ssm_cfg["use_fast_path"] = False
-
     factory_kwargs = {"device": device, "dtype": dtype}
     mixer_cls = partial(Mamba, layer_idx=layer_idx, **ssm_cfg, **factory_kwargs)
-    norm_cls = partial(
-        nn.LayerNorm if not rms_norm else RMSNorm, eps=norm_epsilon, **factory_kwargs
-    )
+    use_rms_norm = bool(rms_norm and RMSNorm is not None)
+    if rms_norm and not use_rms_norm:
+        logger.warning("RMSNorm kernels are unavailable; falling back to nn.LayerNorm in Mamba blocks.")
+    base_norm_cls = RMSNorm if use_rms_norm else nn.LayerNorm
+    norm_cls = partial(base_norm_cls, eps=norm_epsilon, **factory_kwargs)
     block = Block(
         d_model,
         mixer_cls,
@@ -401,17 +402,26 @@ class MambaModel(MambaPreTrainedModel):
         self.fused_add_norm = config.fused_add_norm
         if self.fused_add_norm:
             if layer_norm_fn is None or rms_norm_fn is None:
-                raise ImportError("Failed to import Triton LayerNorm / RMSNorm kernels")
+                # Fallback to unfused LayerNorm/RMSNorm when Triton kernels are unavailable.
+                self.fused_add_norm = False
+
+        self.use_rms_norm = bool(config.rms_norm and RMSNorm is not None)
+        if config.rms_norm and not self.use_rms_norm:
+            logger.warning("RMSNorm kernels are unavailable; using nn.LayerNorm for final norm.")
+
+        norm_eps = getattr(config, "norm_epsilon", None)
+        if norm_eps is None:
+            norm_eps = getattr(config, "layer_norm_epsilon", 1e-5)
 
         self.layers = nn.ModuleList(
             [
                 create_block(
                     config.d_model,
                     ssm_cfg=config.ssm_cfg,
-                    norm_epsilon=config.norm_epsilon,
-                    rms_norm=config.rms_norm,
+                    norm_epsilon=norm_eps,
+                    rms_norm=self.use_rms_norm,
                     residual_in_fp32=config.residual_in_fp32,
-                    fused_add_norm=config.fused_add_norm,
+                    fused_add_norm=self.fused_add_norm,
                     layer_idx=i,
                     **factory_kwargs,
                 )
@@ -419,15 +429,15 @@ class MambaModel(MambaPreTrainedModel):
             ]
         )
 
-        self.norm_f = (nn.LayerNorm if not config.rms_norm else RMSNorm)(
-            config.d_model, eps=config.norm_epsilon, **factory_kwargs
+        self.norm_f = (RMSNorm if self.use_rms_norm else nn.LayerNorm)(
+            config.d_model, eps=norm_eps, **factory_kwargs
         )
 
         self.apply(
             partial(
                 _init_weights,
                 n_layer=config.n_layer,
-                **(config.initializer_cfg if config.initializer_cfg is not None else {}),
+                **(getattr(config, "initializer_cfg", None) or {}),
             )
         )
 
@@ -513,7 +523,7 @@ class MambaForCausalLM(MambaPreTrainedModel, GenerationMixin):
             partial(
                 _init_weights,
                 n_layer=config.n_layer,
-                **(config.initializer_cfg if config.initializer_cfg is not None else {}),
+                **(getattr(config, "initializer_cfg", None) or {}),
             )
         )
         self.tie_weights()
@@ -584,6 +594,13 @@ class MambaForCausalLM(MambaPreTrainedModel, GenerationMixin):
 
         return CausalLMOutputWithPast(loss=loss, logits=logits)
 
-AutoConfig.register("mamba", MambaConfig)
-AutoModelForCausalLM.register(MambaConfig, MambaForCausalLM)
-
+try:
+    AutoConfig.register("mamba", MambaConfig)
+except ValueError:
+    # Already registered by a newer Transformers build.
+    pass
+try:
+    AutoModelForCausalLM.register(MambaConfig, MambaForCausalLM)
+except ValueError:
+    # Already registered by a newer Transformers build.
+    pass

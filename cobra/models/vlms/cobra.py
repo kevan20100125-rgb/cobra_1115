@@ -152,7 +152,29 @@ class CobraVLM(VLM):
         ), "CobraVLM `from_pretrained` expects checkpoint with keys for `projector` AND `llm_backbone`!"
 
         vlm.projector.load_state_dict(model_state_dict["projector"])
-        vlm.llm_backbone.load_state_dict(model_state_dict["llm_backbone"])
+
+        # CFZO Mamba adds per-layer `mamba_scale` parameters that are not present
+        # in legacy checkpoints. Allow only these keys to be missing.
+        missing_keys, unexpected_keys = vlm.llm_backbone.load_state_dict(
+            model_state_dict["llm_backbone"], strict=False
+        )
+        missing_keys = list(missing_keys)
+        unexpected_keys = list(unexpected_keys)
+
+        allowed_missing_suffix = ".mixer.mamba_scale"
+        disallowed_missing = [k for k in missing_keys if not k.endswith(allowed_missing_suffix)]
+        if disallowed_missing or unexpected_keys:
+            preview = lambda xs: ", ".join(xs[:8]) + (" ..." if len(xs) > 8 else "")
+            raise RuntimeError(
+                "Failed to load Cobra LLM checkpoint with incompatible keys. "
+                f"disallowed_missing={len(disallowed_missing)} [{preview(disallowed_missing)}], "
+                f"unexpected={len(unexpected_keys)} [{preview(unexpected_keys)}]"
+            )
+        if missing_keys:
+            overwatch.info(
+                f"LLM checkpoint missing {len(missing_keys)} CFZO-only `mamba_scale` keys; using default init.",
+                ctx_level=1,
+            )
 
         # Freeze Weights
         vlm.requires_grad_(False)
@@ -584,4 +606,3 @@ class CobraVLM(VLM):
         generated_text = tokenizer.decode(generated_ids[0, input_ids.shape[1] :], skip_special_tokens=True).strip()
 
         return generated_text
-
