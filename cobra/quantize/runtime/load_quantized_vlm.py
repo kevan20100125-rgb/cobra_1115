@@ -251,6 +251,61 @@ def _maybe_enable_llm_mixer_hadamard(llm, *, ptq_stage: int = 0):
         f"applied={applied} skipped={skipped}"
     )
 
+def _restrict_llm_act_quant_to_out_proj(vlm: nn.Module) -> None:
+    """
+    Keep activation quantization enabled ONLY for:
+        llm_backbone.llm.backbone.layers.*.mixer.out_proj
+
+    All other LLM-side Quant* modules keep their wrapper structure and can still
+    participate in weight quantization, but their activation quantizers are disabled.
+
+    IMPORTANT:
+      - This helper must be called AFTER the global set_quant_state(...)
+        because set_quant_state(...) will otherwise re-enable act_quant broadly.
+      - We only touch modules under llm_backbone.llm.*.
+    """
+    from cobra.quantize.int_linear import QuantLinear
+    from cobra.quantize.int_conv import QuantConv1d, QuantConv2d
+    from cobra.quantize.int_matmul import QuantMatMul
+
+    keep_suffix = ".mixer.out_proj"
+
+    num_keep = 0
+    num_disable = 0
+
+    for module_path, module in vlm.named_modules():
+        if not module_path.startswith("llm_backbone.llm."):
+            continue
+
+        if not isinstance(module, (QuantLinear, QuantConv1d, QuantConv2d, QuantMatMul)):
+            continue
+
+        keep = module_path.endswith(keep_suffix)
+
+        # Wrapper-level gate
+        if hasattr(module, "use_act_quant"):
+            module.use_act_quant = bool(keep)
+
+        # Underlying quantizer-level gates
+        for attr in ("act_quantizer", "x1_quantizer", "x2_quantizer"):
+            q = getattr(module, attr, None)
+            if q is None:
+                continue
+            q.set_quant_state(enable=keep, is_dynamic=False)
+
+            if not keep:
+                q.is_observing = False
+                q.observered = False
+
+        if keep:
+            num_keep += 1
+        else:
+            num_disable += 1
+
+    print(
+        f"[Info] Restricted llm activation quant to out_proj only: "
+        f"keep={num_keep} disable={num_disable} suffix={keep_suffix!r}"
+    )
 
 # -----------------------------------------------------------------------------
 # Public entrypoint
@@ -259,7 +314,7 @@ def _maybe_enable_llm_mixer_hadamard(llm, *, ptq_stage: int = 0):
 def load_quantized_cobra_vlm(
     *,
     bits: Optional[str],
-    pct_hi_lo_path,  # kept for interface compatibility
+    pct_hi_lo_path,  # now used when A-bits are requested
     hf_token: str,
     base_dtype,
     device,
@@ -268,13 +323,18 @@ def load_quantized_cobra_vlm(
     output_dir=None,
 ):
     """
-    Adds optional LLM mixer rotation:
-      - Hadamard-only: COBRA_LLM_MIXER_HADAMARD=1
-      - Hadamard + act-KLT: COBRA_LLM_MIXER_HADAMARD=1 and COBRA_LLM_MIXER_ACT_KLT=1
+    Runtime loader for Cobra fake-quant PTQ.
 
-    IMPORTANT:
-      Mamba fast path can bypass nn.Linear(out_proj) calls, which prevents forward_pre_hook from firing.
-      When mixer rotation is enabled, we automatically set COBRA_DISABLE_MAMBA_FAST_PATH=1 unless user already set it.
+    Supported:
+      - W-only:  W8 / W4 / W2
+      - WA:      W8A8 / W4A8 / ...
+      - A-only:  A8 / A16
+
+    New behavior:
+      - If env COBRA_LLM_ACT_ONLY=out_proj, then AFTER global quant-state enable,
+        we restrict LLM activation quantization to:
+            llm_backbone.llm.backbone.layers.*.mixer.out_proj
+        while leaving all other LLM Quant* modules wrapped and eligible for W-quant.
     """
     import json
     from collections import defaultdict
@@ -286,20 +346,47 @@ def load_quantized_cobra_vlm(
         this_file = __file__
     except Exception:
         this_file = "<unknown>"
+
+    llm_act_only = os.environ.get("COBRA_LLM_ACT_ONLY", "").strip().lower()
+
     print(f"[INFO] load_quantized_cobra_vlm ENTER  file={this_file}")
     print(
         "[INFO] env "
         f"COBRA_LLM_MIXER_HADAMARD={os.environ.get('COBRA_LLM_MIXER_HADAMARD', '')!r} "
         f"COBRA_LLM_MIXER_ACT_KLT={os.environ.get('COBRA_LLM_MIXER_ACT_KLT', '')!r} "
-        f"COBRA_LLM_MIXER_OUT_TRANSFORM={os.environ.get('COBRA_LLM_MIXER_OUT_TRANSFORM', '')!r} "
-        f"ACT_KLT_OUTPROJ_IN={os.environ.get('ACT_KLT_OUTPROJ_IN', '')!r} "
-        f"ACT_KLT_OUTPROJ_OUT={os.environ.get('ACT_KLT_OUTPROJ_OUT', '')!r} "
-        f"COBRA_DISABLE_MAMBA_FAST_PATH={os.environ.get('COBRA_DISABLE_MAMBA_FAST_PATH', '')!r}"
+        f"COBRA_DISABLE_MAMBA_FAST_PATH={os.environ.get('COBRA_DISABLE_MAMBA_FAST_PATH', '')!r} "
+        f"COBRA_LLM_ACT_ONLY={llm_act_only!r}"
+    )
+    print(
+        f"[INFO] args bits={bits!r} pct_hi_lo_path={pct_hi_lo_path!r} "
+        f"enabled_targets={enabled_targets!r}"
     )
 
-    w_bits, a_bits = parse_bits_spec(bits)
+    # -----------------------------
+    # 0.1) Normalize enabled_targets
+    # -----------------------------
+    if enabled_targets is None:
+        enabled_targets_set = {"vision.dino", "vision.siglip", "llm", "projector"}
+    else:
+        enabled_targets_set = set(enabled_targets)
 
-    # Resolve output_dir
+    # -----------------------------
+    # 0.2) Parse bits
+    # -----------------------------
+    w_bits, a_bits = parse_bits_spec(bits)
+    do_weight = w_bits is not None
+    do_act = a_bits is not None
+
+    if not do_weight and not do_act:
+        model_id_or_path = _resolve_model_id_or_path()
+        print(f"[load_quantized_cobra_vlm] bits={bits!r} -> loading FLOAT Cobra from {model_id_or_path!r} ...")
+        vlm = cobra_load(model_id_or_path, hf_token=hf_token)
+        vlm.to(device=device, dtype=base_dtype)
+        return vlm
+
+    # -----------------------------
+    # 0.3) Output dir best-effort
+    # -----------------------------
     if output_dir is None:
         if run_dir is not None:
             output_dir = Path(run_dir) / "outputs" / "quantize"
@@ -308,22 +395,24 @@ def load_quantized_cobra_vlm(
                 output_dir = Path(pct_hi_lo_path).parent
             except Exception:
                 output_dir = None
+
     if output_dir is not None:
-        Path(output_dir).mkdir(parents=True, exist_ok=True)
-
-    # Float fallback (no weight quant requested)
-    if w_bits is None:
-        model_id_or_path = _resolve_model_id_or_path()
-        print(f"[load_quantized_cobra_vlm] w_bits=None (bits={bits!r}) → loading FLOAT Cobra from {model_id_or_path!r} ...")
-        vlm = cobra_load(model_id_or_path, hf_token=hf_token)
-        vlm.to(device=device, dtype=base_dtype)
-        return vlm
-
-    if pct_hi_lo_path is not None:
-        print("[INFO] NOTE: pct_hi_lo_path is ignored (activation remains float).")
+        try:
+            Path(output_dir).mkdir(parents=True, exist_ok=True)
+        except Exception as e:
+            print(f"[WARN] output_dir mkdir failed: {output_dir!r} ({repr(e)})")
+            output_dir = None
 
     # -----------------------------
-    # 0.5) If mixer rotation enabled, force Mamba slow path (before model construction)
+    # 0.4) A-quant requires pct_hi_lo_path
+    # -----------------------------
+    if do_act and pct_hi_lo_path is None:
+        print(
+            f"[WARN] A-bits requested (A{a_bits}) but pct_hi_lo_path is None -> act_quant will stay OFF."
+        )
+
+    # -----------------------------
+    # 0.5) If mixer rotation enabled, force Mamba slow path
     # -----------------------------
     mixer_rot_enabled = _env_flag("COBRA_LLM_MIXER_HADAMARD", default=False)
     if mixer_rot_enabled:
@@ -337,16 +426,13 @@ def load_quantized_cobra_vlm(
     # 1) Load float Cobra VLM
     # -----------------------------
     model_id_or_path = _resolve_model_id_or_path()
-    print(f"[load_quantized_cobra_vlm] Loading FLOAT Cobra from {model_id_or_path!r} ...")
-
+    print(f"[load_quantized_cobra_vlm] loading FLOAT Cobra from {model_id_or_path!r} ...")
     vlm = cobra_load(model_id_or_path, hf_token=hf_token)
     vlm.to(device=device, dtype=base_dtype)
 
     # -----------------------------
-    # 2) Wrap model (Quant* modules)
+    # 2) Wrap model into Quant* modules
     # -----------------------------
-    enabled_targets_set = set(enabled_targets) if enabled_targets else {"llm"}  # default to LLM only
-
     wrap_policy_cfg = WrapPolicyConfig(
         enable_vision_dino="vision.dino" in enabled_targets_set,
         enable_vision_siglip="vision.siglip" in enabled_targets_set,
@@ -384,37 +470,99 @@ def load_quantized_cobra_vlm(
         traceback.print_exc()
 
     # -----------------------------
-    # 3) Apply runtime weight bits
+    # 3) Apply runtime weight bits (optional)
     # -----------------------------
-    _apply_runtime_weight_bits(vlm, w_bits=int(w_bits))
+    if do_weight:
+        _apply_runtime_weight_bits(vlm, w_bits=int(w_bits))
+    else:
+        print("[Info] W-bits not requested -> weight quant will stay OFF (weights remain float).")
 
     # -----------------------------
-    # 4) Enable fake quant flags (activation remains float)
+    # 4) Apply activation hi/lo calibration (optional; requires pct_hi_lo_path)
     # -----------------------------
-    set_quant_state(vlm, weight_quant=True, act_quant=False)
+    act_calib_summary = None
+    act_calib_enabled = bool(do_act and pct_hi_lo_path is not None)
+
+    if act_calib_enabled:
+        from cobra.quantize.pct.calibrator import calibrate_model_from_hi_lo
+
+        try:
+            hi_lo_map = torch.load(pct_hi_lo_path, map_location="cpu")
+        except Exception as e:
+            hi_lo_map = None
+            print(f"[WARN] Failed to load pct_hi_lo_path={pct_hi_lo_path!r} ({repr(e)})")
+
+        if hi_lo_map is not None:
+            try:
+                act_calib_summary = calibrate_model_from_hi_lo(
+                    vlm,
+                    hi_lo_map,
+                    act_bits=int(a_bits),
+                    signed=True,
+                    include_targets=sorted(enabled_targets_set) if enabled_targets_set else None,
+                )
+                print(f"[Info] Activation hi/lo calibrated for A{int(a_bits)} (pct_hi_lo_path={pct_hi_lo_path!r}).")
+            except Exception as e:
+                import traceback
+                print("[WARN] calibrate_model_from_hi_lo crashed; act_quant will be OFF.")
+                print(f"[WARN] Exception: {repr(e)}")
+                traceback.print_exc()
+                act_calib_enabled = False
+        else:
+            act_calib_enabled = False
+
+        if output_dir is not None and act_calib_summary is not None:
+            try:
+                out_path = Path(output_dir) / f"act_calib_A{int(a_bits)}.json"
+                out_path.write_text(json.dumps(act_calib_summary, indent=2))
+            except Exception:
+                pass
 
     # -----------------------------
-    # 5) Emit coverage
+    # 5) Enable quant flags globally
+    # -----------------------------
+    set_quant_state(vlm, weight_quant=bool(do_weight), act_quant=bool(act_calib_enabled))
+
+    # -----------------------------
+    # 5.1) Optional post-gate:
+    #      keep LLM activation quant ONLY on *.mixer.out_proj
+    # -----------------------------
+    if act_calib_enabled and llm_act_only == "out_proj":
+        _restrict_llm_act_quant_to_out_proj(vlm)
+
+    # -----------------------------
+    # 6) Emit coverage
     # -----------------------------
     if output_dir is not None and registry is not None:
         by_target = defaultdict(list)
         for target, module_path in _iter_wrap_registry_entries(registry):
             by_target[target].append(module_path)
 
+        bits_effective = []
+        if do_weight:
+            bits_effective.append(f"W{int(w_bits)}")
+        if do_act and act_calib_enabled:
+            bits_effective.append(f"A{int(a_bits)}")
+        elif do_act and not act_calib_enabled:
+            bits_effective.append(f"A{int(a_bits)}(OFF)")
+        bits_effective = "".join(bits_effective) if bits_effective else "FLOAT"
+
         coverage_payload = {
-            "stage": "runtime_weight_only",
+            "stage": "runtime_WA" if (do_weight and do_act) else ("runtime_W_only" if do_weight else "runtime_A_only"),
             "bits_raw": bits,
-            "bits_effective": f"W{int(w_bits)}",
+            "bits_effective": bits_effective,
             "backend": "fake",
+            "act_pct_hi_lo_path": str(pct_hi_lo_path) if pct_hi_lo_path is not None else None,
+            "llm_act_only": llm_act_only if llm_act_only else None,
             "counts": {k: len(v) for k, v in by_target.items()},
             "module_paths": dict(by_target),
         }
 
-        out_path = Path(output_dir) / f"coverage_W{int(w_bits)}.json"
+        out_name = f"coverage_{bits_effective}.json".replace("/", "_")
+        out_path = Path(output_dir) / out_name
         try:
             out_path.write_text(json.dumps(coverage_payload, indent=2))
         except Exception:
             pass
 
     return vlm
-

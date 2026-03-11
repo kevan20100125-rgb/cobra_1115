@@ -65,7 +65,6 @@ from cobra.quantize.pct.collect import (
 )
 from cobra.quantize.pct.apply import build_hi_lo_map
 from cobra.quantize.runtime.config import QuantRuntimeConfig
-from cobra.quantize.runtime.pipeline_spec import CANONICAL_TARGETS, add_fusion_stage_to_target_map
 from cobra.quantize.wrap.policy import WrapPolicyConfig
 from cobra.quantize.wrap.registry import build_wrap_registry
 from cobra.quantize.rotate.projector import SHARED_KLT_PATH, load_klt_matrix
@@ -74,6 +73,64 @@ from cobra.util import set_global_seed
 # Disable Tokenizers Parallelism to Play Nice w/ PyTorch Multiprocessing DataLoaders
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
+# =====================================================================
+# Local pipeline-spec replacements
+# =====================================================================
+
+# Keep this local to avoid depending on the deleted
+# cobra.quantize.runtime.pipeline_spec module.
+CANONICAL_TARGETS: Tuple[str, ...] = (
+    "vision.dino",
+    "vision.siglip",
+    "llm",
+    "projector",
+)
+
+
+def _add_fusion_stage_to_target_map(
+    *,
+    model: nn.Module,
+    enabled_targets,
+    target_to_modules: Dict[str, List[str]],
+) -> None:
+    """
+    Local replacement for the removed add_fusion_stage_to_target_map(...).
+
+    Why this exists:
+      - quant_calibrate previously imported this helper from pipeline_spec.py.
+      - The deleted helper was only needed to make the explicit FusionStage
+        visible to activation collection / hi-lo calibration.
+      - FusionStage is not part of wrap_registry's wrapped Quant* modules, so
+        it must be appended manually.
+
+    Design choice:
+      - We attach fusion_stage under target "projector".
+        This is the least disruptive choice for the current Cobra Point-B
+        clipping / quant flow, because fusion_stage sits between projector-side
+        multimodal fusion and the LLM input path.
+      - We only add it if:
+          1) "projector" is enabled in the percentile pipeline
+          2) model.fusion_stage exists and is an nn.Module
+    """
+    if "projector" not in set(enabled_targets):
+        return
+
+    fusion_stage = getattr(model, "fusion_stage", None)
+    if fusion_stage is None:
+        return
+    if not isinstance(fusion_stage, nn.Module):
+        return
+
+    mods = list(target_to_modules.get("projector", []))
+    if "fusion_stage" not in mods:
+        mods.append("fusion_stage")
+        mods = sorted(set(mods))
+        target_to_modules["projector"] = mods
+
+    overwatch.info(
+        "[QuantCalibrate] Added explicit fusion_stage to target map under 'projector'. "
+        "fusion_module_name='fusion_stage'"
+    )
 # Initialize Overwatch => Wraps `logging.Logger`
 overwatch = initialize_overwatch(__name__)
 
@@ -266,12 +323,22 @@ def _build_target_module_map_from_wrap_registry(
     cfg: QuantCalibrateConfig,
     wrap_registry,
 ) -> Dict[str, List[str]]:
-    # Modules considered "wrapped" (i.e., eligible for quantization) under the current policy.
+    """
+    Build target -> module-path mapping from WrapRegistry, with optional
+    path-level narrowing for LLM activation collection.
+
+    New behavior:
+      - If env COBRA_LLM_ACT_ONLY=out_proj, then under target "llm" we only keep
+        module paths ending with ".mixer.out_proj".
+      - Other targets remain unchanged.
+      - FusionStage is still appended manually under "projector".
+    """
     modules_by_target: Mapping[str, Sequence[str]] = wrap_registry.module_paths_by_target(
-        include_targets = CANONICAL_TARGETS
+        include_targets=CANONICAL_TARGETS
     )
 
-    enabled_targets = cfg.quant_cfg.use_pct_for
+    enabled_targets = set(cfg.quant_cfg.use_pct_for)
+    llm_act_only = os.environ.get("COBRA_LLM_ACT_ONLY", "").strip().lower()
 
     target_to_modules: Dict[str, List[str]] = {}
 
@@ -283,7 +350,39 @@ def _build_target_module_map_from_wrap_registry(
         if not mod_names:
             continue
 
-        mod_names = sorted(mod_names)
+        mod_names = sorted(set(mod_names))
+
+        # --------------------------------------------------------------
+        # Optional path-level narrowing for LLM activation collection
+        # --------------------------------------------------------------
+        if target == "llm" and llm_act_only == "out_proj":
+            before = len(mod_names)
+            mod_names = [p for p in mod_names if p.endswith(".mixer.out_proj")]
+            after = len(mod_names)
+
+            overwatch.info(
+                "[QuantCalibrate] Applied llm path filter: COBRA_LLM_ACT_ONLY=out_proj",
+                extra={
+                    "target": "llm",
+                    "before": before,
+                    "after": after,
+                    "suffix": ".mixer.out_proj",
+                },
+            )
+
+            if not mod_names:
+                overwatch.warning(
+                    "[QuantCalibrate] LLM out_proj-only filter produced 0 modules. "
+                    "Please verify module naming / wrap registry.",
+                    extra={
+                        "target": "llm",
+                        "suffix": ".mixer.out_proj",
+                    },
+                )
+
+        if not mod_names:
+            continue
+
         target_to_modules[target] = mod_names
 
     if not target_to_modules:
@@ -295,6 +394,7 @@ def _build_target_module_map_from_wrap_registry(
                 "quant_bits": cfg.quant_bits,
                 "backend": cfg.backend,
                 "use_pct_for": sorted(cfg.quant_cfg.use_pct_for),
+                "llm_act_only": llm_act_only,
             },
         )
 
@@ -303,22 +403,22 @@ def _build_target_module_map_from_wrap_registry(
         mods = target_to_modules.get(target, [])
         if mods:
             overwatch.info(
-                f"[QuantCalibrate] Target={target!r} (from WrapRegistry) → "
+                f"[QuantCalibrate] Target={target!r} (from WrapRegistry) -> "
                 f"{len(mods)} module(s); example: {mods[0]!r}"
             )
         else:
             overwatch.info(
-                f"[QuantCalibrate] Target={target!r} (from WrapRegistry) → 0 modules"
+                f"[QuantCalibrate] Target={target!r} (from WrapRegistry) -> 0 modules"
             )
 
-    add_fusion_stage_to_target_map(
+    # FusionStage is not a wrapped Quant* module, so append it manually.
+    _add_fusion_stage_to_target_map(
         model=model,
         enabled_targets=enabled_targets,
         target_to_modules=target_to_modules,
     )
 
     return target_to_modules
-
 
 def _summarize_hi_lo_map(
     hi_lo_map: Mapping[str, Mapping[str, float]],
@@ -449,6 +549,8 @@ def quant_calibrate(cfg: QuantCalibrateConfig) -> None:
     else:
         hf_token = os.environ[cfg.hf_token]
 
+    llm_act_only = os.environ.get("COBRA_LLM_ACT_ONLY", "").strip().lower()
+
     overwatch.info(
         "[QuantCalibrate] Effective QuantRuntimeConfig",
         extra={
@@ -458,6 +560,7 @@ def quant_calibrate(cfg: QuantCalibrateConfig) -> None:
             "weight_bits": cfg.quant_cfg.weight_bits,
             "act_bits": cfg.quant_cfg.act_bits,
             "use_pct_for": sorted(cfg.quant_cfg.use_pct_for),
+            "llm_act_only": llm_act_only,
         },
     )
 
@@ -512,7 +615,7 @@ def quant_calibrate(cfg: QuantCalibrateConfig) -> None:
 
     vlm.to(device=device, dtype=dtype)
     vlm.eval()
-   
+
     # ------------------------------------------------------------------
     # Configure FusionStage rotation BEFORE activation collection.
     # This aligns calibration stats with Point-B global rotation/clipping/quant.
@@ -597,9 +700,16 @@ def quant_calibrate(cfg: QuantCalibrateConfig) -> None:
 
     # ------------------------------------------------------------------
     # Optional LLM tap context (for Mamba backbone activations)
+    #
+    # IMPORTANT:
+    #   If COBRA_LLM_ACT_ONLY=out_proj, we intentionally DISABLE the coarse
+    #   LLM tap path so that calibration stays restricted to module-level
+    #   collectors on *.mixer.out_proj only.
     # ------------------------------------------------------------------
     llm_tap_ctx: Optional[LLMActivationTapContext] = None
-    if "llm" in cfg.quant_cfg.use_pct_for:
+    enable_llm_tap = ("llm" in cfg.quant_cfg.use_pct_for) and (llm_act_only != "out_proj")
+
+    if enable_llm_tap:
         llm_tap_ctx = LLMActivationTapContext(
             enabled=True,
             max_samples_per_module=cfg.max_samples_per_module,
@@ -611,11 +721,16 @@ def quant_calibrate(cfg: QuantCalibrateConfig) -> None:
             extra={
                 "stage": "collect",
                 "max_samples_per_module": cfg.max_samples_per_module,
+                "llm_act_only": llm_act_only,
             },
         )
     else:
-        # Ensure no stale context leaks from previous runs.
         set_global_llm_tap_context(None)
+        if "llm" in cfg.quant_cfg.use_pct_for and llm_act_only == "out_proj":
+            overwatch.info(
+                "[QuantCalibrate] Disabled coarse LLM tap context because "
+                "COBRA_LLM_ACT_ONLY=out_proj; using module-level out_proj collectors only."
+            )
 
     # ------------------------------------------------------------------
     # Calibration Loop: Run Batches through the Model
@@ -625,7 +740,6 @@ def quant_calibrate(cfg: QuantCalibrateConfig) -> None:
 
     with torch.inference_mode():
         for batch in train_dataloader:
-            # Respect calibration budget
             if cfg.max_calib_batches > 0 and num_batches_processed >= cfg.max_calib_batches:
                 break
 
@@ -633,7 +747,6 @@ def quant_calibrate(cfg: QuantCalibrateConfig) -> None:
                 f"[QuantCalibrate] >>> Forward batch {num_batches_processed}"
             )
 
-            # Move batch to device (support both tensor and nested dict(pixel_values))
             batch_on_device: Dict[str, Any] = {}
             for k, v in batch.items():
                 if isinstance(v, torch.Tensor):
@@ -674,15 +787,13 @@ def quant_calibrate(cfg: QuantCalibrateConfig) -> None:
         )
 
     # ------------------------------------------------------------------
-    # Build Percentile Stats and Persist (Minimal pipeline 的必要輸出)
+    # Build Percentile Stats and Persist
     # ------------------------------------------------------------------
     stats = build_activation_stats(
         collectors,
         mode="activation",
     )
 
-    # Once stats have been built, clear the global tap context to avoid
-    # leaking state into other scripts or subsequent runs.
     set_global_llm_tap_context(None)
 
     overwatch.info(
@@ -691,11 +802,10 @@ def quant_calibrate(cfg: QuantCalibrateConfig) -> None:
     )
     torch.save(stats, cfg.pct_stats_out)
 
-    # Clean up hooks
     remove_activation_collectors(collectors)
 
     # ------------------------------------------------------------------
-    # Convenience mode: Run Best-Percentile → hi/lo（不動 model，本地只產生 hi/lo）
+    # Convenience mode: stats -> best-percentile -> hi/lo
     # ------------------------------------------------------------------
     overwatch.info(
         "[QuantCalibrate] Running best-percentile selection + hi/lo mapping (no model calibration)",
@@ -710,10 +820,9 @@ def quant_calibrate(cfg: QuantCalibrateConfig) -> None:
     overwatch.info(
         "[QuantCalibrate] Enabled targets for percentile pipeline: "
         + (", ".join(enabled_targets) if enabled_targets else "<none>"),
-        extra={"use_pct_for": enabled_targets},
+        extra={"use_pct_for": enabled_targets, "llm_act_only": llm_act_only},
     )
 
-    # Build hi/lo map directly from stats; let best_percentile.py choose per-target percentiles.
     hi_lo_map = build_hi_lo_map(
         stats=stats,
         best_percent_map=None,
@@ -723,12 +832,11 @@ def quant_calibrate(cfg: QuantCalibrateConfig) -> None:
         targets=enabled_targets,
     )
 
-    # Save hi/lo map as a simple torch file
     cfg.pct_hi_lo_out.parent.mkdir(parents=True, exist_ok=True)
     torch.save(hi_lo_map, cfg.pct_hi_lo_out)
 
     # ------------------------------------------------------------------
-    # Build JSON summary 
+    # Build JSON summary
     # ------------------------------------------------------------------
     entries = _summarize_hi_lo_map(hi_lo_map)
 
@@ -748,6 +856,7 @@ def quant_calibrate(cfg: QuantCalibrateConfig) -> None:
             "backend": cfg.backend,
             "quant_use_pct_for": sorted(cfg.quant_cfg.use_pct_for),
             "targets_effective": enabled_targets,
+            "llm_act_only": llm_act_only,
         },
         "num_entries": len(hi_lo_map),
         "by_target": {},
@@ -766,7 +875,6 @@ def quant_calibrate(cfg: QuantCalibrateConfig) -> None:
         tgt = entry.get("target", "<unknown>")
         by_target[tgt] = by_target.get(tgt, 0) + 1
 
-        # Only aggregate stats for known targets
         if tgt == "<unknown>":
             continue
 
@@ -788,7 +896,6 @@ def quant_calibrate(cfg: QuantCalibrateConfig) -> None:
 
     summary["by_target"] = by_target
 
-    # Per-target stats: count + min/max/mean for percentile/hi/lo
     per_target_stats: Dict[str, Dict[str, float]] = {}
     for tgt, values in per_target_values.items():
         pct_vals = values["percentile"]
@@ -815,7 +922,6 @@ def quant_calibrate(cfg: QuantCalibrateConfig) -> None:
 
     summary["per_target_stats"] = per_target_stats
 
-    # Global stats across all targets
     all_pct: List[float] = []
     all_hi: List[float] = []
     all_lo: List[float] = []
@@ -845,12 +951,10 @@ def quant_calibrate(cfg: QuantCalibrateConfig) -> None:
     # ------------------------------------------------------------------
     coverage: Dict[str, Any] = {}
 
-    # Wrapped modules according to wrap policy/manifest
     wrapped_modules_by_target = wrap_registry.module_paths_by_target(
-        include_targets = CANONICAL_TARGETS
+        include_targets=CANONICAL_TARGETS
     )
 
-    # Activation coverage from stats (collectors)
     observed_by_target: Dict[str, set] = {t: set() for t in CANONICAL_TARGETS}
     for rec in stats.values():
         tgt = str(rec.get("target", ""))
@@ -858,7 +962,6 @@ def quant_calibrate(cfg: QuantCalibrateConfig) -> None:
         if tgt in CANONICAL_TARGETS and mod:
             observed_by_target[tgt].add(mod)
 
-    # Calibration coverage from hi/lo map
     calibrated_by_target: Dict[str, set] = {t: set() for t in CANONICAL_TARGETS}
     for _, rec in hi_lo_map.items():
         tgt = str(rec.get("target", ""))
@@ -886,7 +989,6 @@ def quant_calibrate(cfg: QuantCalibrateConfig) -> None:
         missing_modules = sorted(wrapped - observed)
 
         coverage[tgt] = {
-            # Backwards-compatible field name; now interpreted as "wrapped modules under policy"
             "configured_modules": int(num_wrapped),
             "activation_observed_modules": int(num_observed),
             "activation_coverage_ratio": activation_coverage_ratio,
@@ -913,8 +1015,8 @@ def quant_calibrate(cfg: QuantCalibrateConfig) -> None:
         },
     )
 
-
 if __name__ == "__main__":
     quant_calibrate()
+
 
 
