@@ -45,7 +45,7 @@ export HF_DATASETS_CACHE="${HF_DATASETS_CACHE:-${HF_HOME}}"
 #   calibrate  -> 只跑 quant_calibrate（產生 pct_stats / pct_hi_lo / summary）
 #   full       -> calibrate + klt
 #   act_klt    -> 只跑 quant_act_klt_outproj（產生 layer-wise act-KLT for out_proj）
-MODE="${MODE:-act_klt}"
+MODE="${MODE:-calibrate}"
 
 # BITS: 例如 W8A8 / W4A4 / W16A16（quant_calibrate 用）
 BITS="${BITS:-W8A8}"
@@ -53,7 +53,7 @@ BITS="${BITS:-W8A8}"
 # SMOKE:
 #   1 -> smoke test（極少 batch 驗證流程）
 #   0 -> 正式校正（使用 QuantCalibrateConfig 的預設為主）
-SMOKE="${SMOKE:-0}"
+SMOKE="${SMOKE:-1}"
 
 # quant_calibrate 的 backend：你目前 repo 只保留 float/fake runtime；校正應走 fake
 BACKEND="${BACKEND:-fake}"
