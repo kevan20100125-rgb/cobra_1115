@@ -1,5 +1,5 @@
 accelerate>=0.25.0
-draccus@ git+https://github.com/dlwh/draccus
+draccus @ git+https://github.com/dlwh/draccus
 einops
 jsonlines
 rich

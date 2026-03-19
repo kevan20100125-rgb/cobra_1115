@@ -45,7 +45,7 @@ Requires-Python: >=3.8
 Description-Content-Type: text/markdown
 License-File: LICENSE
 Requires-Dist: accelerate>=0.25.0
-Requires-Dist: draccus@ git+https://github.com/dlwh/draccus
+Requires-Dist: draccus @ git+https://github.com/dlwh/draccus
 Requires-Dist: einops
 Requires-Dist: jsonlines
 Requires-Dist: rich

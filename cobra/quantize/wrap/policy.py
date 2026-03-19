@@ -47,30 +47,14 @@ from typing import Optional
 import torch.nn as nn
 
 from cobra.overwatch import initialize_overwatch
-
+from cobra.quantize.targets import CANONICAL_TARGETS, infer_target_from_module_path
 from .manifest import WrapRule
 
 overwatch = initialize_overwatch(__name__)
 
-
-# ============================================================================
-# Canonical targets
-# ============================================================================
-
-_CANONICAL_TARGETS = (
-    "vision.dino",
-    "vision.siglip",
-    "llm",
-    "projector",
-)
-
-
 # ============================================================================
 # Config
 # ============================================================================
-
-
-@dataclass
 @dataclass
 class WrapPolicyConfig:
     """
@@ -81,105 +65,54 @@ class WrapPolicyConfig:
         - enable_vision_siglip
         - enable_llm
         - enable_projector
-        - enable_fusion
 
     Op-kind inclusion flags:
-        - include_linear:  wrap nn.Linear-like modules
-        - include_conv:    wrap nn.ConvNd-like modules
+        - include_linear
+        - include_conv
 
     Exclusions:
-        - exclude_layernorm: skip nn.LayerNorm and similar normalization layers
-        - exclude_embedding: skip nn.Embedding and similar embedding layers
-        - exclude_name_regex: optional regex against module path
+        - exclude_layernorm
+        - exclude_embedding
+        - exclude_name_regex
     """
 
-    # Per-target enable switches
     enable_vision_dino: bool = True
     enable_vision_siglip: bool = True
     enable_llm: bool = True
     enable_projector: bool = True
-    enable_fusion: bool = True
 
-    # Op kinds
     include_linear: bool = True
     include_conv: bool = True
 
-    # Exclusions
     exclude_layernorm: bool = True
     exclude_embedding: bool = True
     exclude_name_regex: Optional[str] = None
 
     def is_target_enabled(self, target: str) -> bool:
-        if target == "vision.dino":
-            return self.enable_vision_dino
-        if target == "vision.siglip":
-            return self.enable_vision_siglip
-        if target == "llm":
-            return self.enable_llm
-        if target == "projector":
-            return self.enable_projector
-        if target == "fusion":
-            return self.enable_fusion
-        return False
-
+        from cobra.quantize.targets import TargetFlags
+        flags = TargetFlags(
+            enable_vision_dino=self.enable_vision_dino,
+            enable_vision_siglip=self.enable_vision_siglip,
+            enable_llm=self.enable_llm,
+            enable_projector=self.enable_projector,
+        )
+        return flags.is_enabled(target)
 
 # ============================================================================
 # Target inference
 # ============================================================================
-
-
-def infer_target_from_module_path(module_path: str) -> Optional[str]:
+def _infer_target_from_module_path(module_path: str):
     """
-    Infer the canonical target name from a module's qualified path.
+    Delegates target inference to the centralized target registry.
 
-    Heuristics are intentionally aligned with:
-        - Fusion stage (Point-B):
-            * "fusion_stage" or "fusion_stage.*"     -> "fusion"
-        - Vision backbones:
-            * "vision_backbone.dino_featurizer.*"    -> "vision.dino"
-            * "vision_backbone.featurizer.*"         -> "vision.dino"
-            * "vision_backbone.siglip_featurizer.*"  -> "vision.siglip"
-        - LLM backbone:
-            * "llm_backbone.llm.*"                   -> "llm"
-        - Projector:
-            * "projector.*"                          -> "projector"
-
-    Returns:
-        A canonical target string, or None if no mapping applies.
+    This ensures that the mapping from module_path → canonical target
+    is defined in a single location (cobra.quantize.targets).
     """
-    module_path = (module_path or "").strip()
-    if not module_path:
-        return None
-
-    # Fusion stage (Point-B)
-    if module_path == "fusion_stage" or module_path.startswith("fusion_stage."):
-        return "fusion"
-
-    # Vision
-    if module_path.startswith("vision_backbone.dino_featurizer"):
-        return "vision.dino"
-    if module_path.startswith("vision_backbone.featurizer"):
-        # Historically, the generic featurizer is DINO in this codebase.
-        return "vision.dino"
-    if module_path.startswith("vision_backbone.siglip_featurizer"):
-        return "vision.siglip"
-
-    # LLM
-    if module_path.startswith("llm_backbone.llm"):
-        return "llm"
-
-    # Projector
-    if module_path.startswith("projector"):
-        return "projector"
-
-    return None
-
+    return infer_target_from_module_path(module_path)
 
 # ============================================================================
 # Default policy
 # ============================================================================
-
-
 class DefaultWrapPolicy:
     """
     Default wrapping policy used by Cobra quantization.
@@ -338,5 +271,3 @@ def build_default_policy(cfg: Optional[WrapPolicyConfig] = None) -> DefaultWrapP
         policy.cfg,
     )
     return policy
-
-

@@ -5,8 +5,6 @@ Draccus Dataclass Definition for a ModelConfig object, with various registered s
 variant thereof. A given model variant configures the following attributes:
     - Pretrained Visual Representation (e.g., OpenAI CLIP ViT-L/14) + Pretrained LLM Backbone (e.g., Mamba 2.8B)
     - VLM Configuration + Parameters (e.g., MLP Projector, Image Preprocessing, etc.)
-    - [Optional] Stage 1 (`align`) Optimization Hyperparameters
-    - Stage 2 (`finetune`) Optimization Hyperparameters
 """
 from dataclasses import dataclass
 from enum import Enum, unique

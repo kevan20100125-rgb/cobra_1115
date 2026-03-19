@@ -129,6 +129,7 @@ class ActivationCollector:
     module_name: str
     buffer: ActivationBuffer
     handle: RemovableHandle
+    hook_kind: str = "forward"
 
     @property
     def numel(self) -> int:
@@ -136,6 +137,7 @@ class ActivationCollector:
 
     def remove(self) -> None:
         self.handle.remove()
+
 
 # ---------------------------------------------------------------------------
 # LLM activation tap context (for models that cannot rely on module hooks)
@@ -242,49 +244,71 @@ def _make_hook(buffer: ActivationBuffer):
     return hook
 
 
+def _make_pre_hook(buffer: ActivationBuffer):
+    def pre_hook(_module: nn.Module, inputs: Tuple[Any, ...]) -> None:
+        if inputs is None:
+            return
+        if isinstance(inputs, tuple):
+            if len(inputs) == 0:
+                return
+            tensor = inputs[0]
+        else:
+            tensor = inputs
+        buffer.update(tensor)
+
+    return pre_hook
+
+
 def register_activation_collectors(
     model: nn.Module,
     target_to_module_names: Mapping[str, Sequence[str]],
     *,
     max_samples_per_module: int = 2_000_000,
     device: Optional[torch.device] = None,
+    allow_missing: bool = False,
+    module_name_to_hook_kind: Optional[Mapping[str, str]] = None,
 ) -> Dict[str, ActivationCollector]:
     """
-    Attach forward hooks to selected modules and return a dict of collectors.
+    Attach forward hooks or forward_pre_hooks to selected modules and return
+    a dict of collectors.
 
-    Args:
-        model: nn.Module in which to register hooks (e.g., CobraVLM instance).
-        target_to_module_names:
-            Mapping from *target name* (any alias accepted by `normalize_target`)
-            to a list of module qualified names as returned by
-            `dict(model.named_modules()).keys()`.
-        max_samples_per_module:
-            Upper bound on the number of activation samples stored per module.
-        device:
-            Device on which to keep the activation reservoir; default is CPU.
+    Hook semantics:
+      - "forward" : collect module outputs
+      - "pre"     : collect module inputs
 
-    Returns:
-        A dict mapping a stable record key:
-            f"{target}::{module_name}"
-        to an ActivationCollector instance.
-
-    Raises:
-        KeyError: if any requested module name cannot be found.
+    For LLM path-aware calibration (e.g. mamba_sensitive / out_proj_only),
+    "pre" is preferred because runtime activation quant is applied to module inputs.
     """
     if device is None:
         device = torch.device("cpu")
 
+    hook_kind_map = {
+        str(k): str(v).strip().lower()
+        for k, v in (module_name_to_hook_kind or {}).items()
+        if k
+    }
+
     name_to_module = dict(model.named_modules())
     collectors: Dict[str, ActivationCollector] = {}
+    missing_paths = []
 
     for raw_target, module_names in target_to_module_names.items():
         target = normalize_target(raw_target)
 
         for module_name in module_names:
             if module_name not in name_to_module:
+                if allow_missing:
+                    missing_paths.append((target, module_name))
+                    continue
                 raise KeyError(f"Module name {module_name!r} not found in model.named_modules()")
 
             module = name_to_module[module_name]
+            hook_kind = hook_kind_map.get(module_name, "forward")
+            if hook_kind not in {"forward", "pre"}:
+                raise ValueError(
+                    f"Unsupported hook_kind={hook_kind!r} for module={module_name!r}; "
+                    "expected one of {'forward', 'pre'}."
+                )
 
             buffer = ActivationBuffer(
                 target=target,
@@ -292,7 +316,11 @@ def register_activation_collectors(
                 max_samples=max_samples_per_module,
                 device=device,
             )
-            hook = module.register_forward_hook(_make_hook(buffer))
+
+            if hook_kind == "pre":
+                hook = module.register_forward_pre_hook(_make_pre_hook(buffer))
+            else:
+                hook = module.register_forward_hook(_make_hook(buffer))
 
             key = f"{target}::{module_name}"
             collectors[key] = ActivationCollector(
@@ -300,12 +328,25 @@ def register_activation_collectors(
                 module_name=module_name,
                 buffer=buffer,
                 handle=hook,
+                hook_kind=hook_kind,
             )
 
             overwatch.debug(
-                f"[PctCollect] Registered hook for target={target!r}, module={module_name!r}",
-                extra={"target": target, "module": module_name},
+                f"[PctCollect] Registered {hook_kind} hook for target={target!r}, module={module_name!r}",
+                extra={"target": target, "module": module_name, "hook_kind": hook_kind},
             )
+
+    if missing_paths:
+        overwatch.warning(
+            "[PctCollect] Some requested module names were not found; skipped because allow_missing=True.",
+            extra={
+                "missing_count": len(missing_paths),
+                "missing_paths": [
+                    {"target": target, "module": module_name}
+                    for target, module_name in missing_paths
+                ],
+            },
+        )
 
     return collectors
 
@@ -465,5 +506,6 @@ def build_activation_stats(
             )
 
     return stats
+
 
 

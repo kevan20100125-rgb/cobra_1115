@@ -36,14 +36,6 @@ def _pct_only_noop_factory(module: nn.Module, params) -> nn.Module:
     """
     return module
 
-
-PCT_ONLY_RULE: WrapRule = WrapRule(
-    source_cls=nn.Module,
-    wrap_kind="pct_only",
-    factory=_pct_only_noop_factory,
-    allow_subclass=True,
-)
-
 @dataclass(frozen=True)
 class WrapEntry:
     """
@@ -135,8 +127,6 @@ class WrapRegistry:
 # ======================================================================
 # Construction
 # ======================================================================
-
-
 def build_wrap_registry(
     model: nn.Module,
     *,
@@ -145,24 +135,11 @@ def build_wrap_registry(
     prefix: str = "",
 ) -> WrapRegistry:
     """
-    Analyse `model` and build a WrapRegistry that records all modules that
-    should be wrapped as Quant* modules according to the provided policy.
+    Build a registry of model modules that should be wrapped for quantization.
 
-    Args:
-        model:
-            The nn.Module to analyse (e.g. Cobra VLM).
-        policy_cfg:
-            Configuration for the DefaultWrapPolicy. If None, a default
-            instance is used.
-        manifest:
-            Optional sequence of WrapRule objects describing type-level
-            wrapping behavior. If None, the default manifest is used.
-        prefix:
-            Optional string; if non-empty, only modules whose path starts
-            with this prefix will be considered.
-
-    Returns:
-        WrapRegistry with one WrapEntry per module to be wrapped.
+    Phase 3:
+      - target taxonomy is centralized in cobra.quantize.targets
+      - no special fusion-stage handling exists anymore
     """
     policy = DefaultWrapPolicy(policy_cfg)
     if manifest is None:
@@ -171,31 +148,11 @@ def build_wrap_registry(
     registry = WrapRegistry()
 
     for module_path, module in model.named_modules():
-        # Skip root module and non-prefix matches
         if module_path == "":
             continue
         if prefix and not module_path.startswith(prefix):
             continue
-
-        # Defensive: skip already-quantized modules
         if is_quantized_module(module):
-            continue
-
-        # --------------------------------------------------------------
-        # Fusion stage as a formal target:
-        # Add a "pct_only" entry for activation clipping calibration/coverage.
-        # This entry must not trigger actual weight wrapping.
-        # --------------------------------------------------------------
-        if module_path == "fusion_stage":
-            target = infer_target_from_module_path(module_path)
-            if target == "fusion" and policy.cfg.is_target_enabled("fusion"):
-                entry = WrapEntry(
-                    module_path=module_path,
-                    target="fusion",
-                    rule_kind=PCT_ONLY_RULE.wrap_kind,
-                    rule=PCT_ONLY_RULE,
-                )
-                registry.add(entry)
             continue
 
         rule = find_wrap_rule_for_module(module, manifest=manifest)
@@ -214,7 +171,6 @@ def build_wrap_registry(
         )
         registry.add(entry)
 
-    # Logging summary
     buckets = registry.by_target()
     total = len(registry)
     if total == 0:
@@ -228,4 +184,3 @@ def build_wrap_registry(
         overwatch.info("[WrapRegistry] " + " | ".join(parts))
 
     return registry
-

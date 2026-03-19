@@ -7,7 +7,7 @@ from .quantizer import UniformAffineQuantizer
 
 class QuantMatMul(nn.Module):
     """
-    Quantized MatMul (MambaQuant-style fake quant).
+    Quantized MatMul (PTQ-style fake quant).
 
     - Wraps a generic matmul-like function (default: torch.matmul).
     - Uses UniformAffineQuantizer for:
@@ -136,3 +136,4 @@ class QuantMatMul(nn.Module):
             self.x1_quantizer.change_n_bits(x1_bits)
         if x2_bits is not None and self.x2_quantizer is not None:
             self.x2_quantizer.change_n_bits(x2_bits)
+

@@ -35,7 +35,7 @@ class UniformAffineQuantizer(nn.Module):
     """
     Core fake quantizer used for both weights and activations.
 
-    This module is MambaQuant-style:
+    This module is PTQ-style:
         - Fake quant only (float kernels, quant/dequant in PyTorch).
         - Supports per-tensor / per-channel / grouped quantization.
         - Can run in:
@@ -285,6 +285,114 @@ class UniformAffineQuantizer(nn.Module):
             x_dequant = x_dequant * rescale_param.to(x_dequant.device)
 
         return x_dequant
+    
+
+    def _shape_can_broadcast_to_input(self, param_shape, input_shape) -> bool:
+        """
+        Conservative NumPy-style broadcast compatibility check.
+        """
+        try:
+            pshape = tuple(int(v) for v in tuple(param_shape))
+            xshape = tuple(int(v) for v in tuple(input_shape))
+        except Exception:
+            return False
+
+        if len(pshape) > len(xshape):
+            return False
+
+        for p_dim, x_dim in zip(reversed(pshape), reversed(xshape)):
+            if p_dim not in (1, x_dim):
+                return False
+
+        return True
+    
+
+    def _validate_static_act_quant_ready(self, x: torch.Tensor):
+        """
+        Validate that static activation fake-quant has a usable scale / zero-point
+        before entering fake_quant().
+
+        Returns
+        -------
+        (ok: bool, reason: str)
+        """
+        scale = self.scale
+
+        if scale is None:
+            return False, "scale_is_none"
+
+        if torch.is_tensor(scale):
+            scale_tensor = scale
+        else:
+            try:
+                scale_tensor = torch.as_tensor(scale, device=x.device)
+            except Exception:
+                return False, "scale_not_tensor_like"
+
+        if scale_tensor.numel() == 0:
+            return False, "scale_empty"
+
+        if not torch.isfinite(scale_tensor).all().item():
+            return False, "scale_nonfinite"
+
+        if not self._shape_can_broadcast_to_input(scale_tensor.shape, x.shape):
+            return (
+                False,
+                f"scale_shape_mismatch(scale_shape={tuple(scale_tensor.shape)}, input_shape={tuple(x.shape)})",
+            )
+
+        round_zero_point = self.round_zero_point
+        if round_zero_point is not None:
+            if torch.is_tensor(round_zero_point):
+                zp_tensor = round_zero_point
+            else:
+                try:
+                    zp_tensor = torch.as_tensor(round_zero_point, device=x.device)
+                except Exception:
+                    return False, "zero_point_not_tensor_like"
+
+            if zp_tensor.numel() == 0:
+                return False, "zero_point_empty"
+
+            if not torch.isfinite(zp_tensor).all().item():
+                return False, "zero_point_nonfinite"
+
+            if not self._shape_can_broadcast_to_input(zp_tensor.shape, x.shape):
+                return (
+                    False,
+                    "zero_point_shape_mismatch"
+                    f"(zero_point_shape={tuple(zp_tensor.shape)}, input_shape={tuple(x.shape)})",
+                )
+
+        return True, "ok"
+    
+
+    def _handle_invalid_static_act_quant(self, x: torch.Tensor, reason: str):
+        """
+        Safety net for invalid static activation quant state.
+
+        Behavior:
+          - emit a one-shot warning
+          - disable this quantizer
+          - fall back to float passthrough
+        """
+        warned = bool(getattr(self, "_invalid_static_quant_warned", False))
+        if not warned:
+            debug_name = getattr(self, "debug_name", "<unknown_quantizer>")
+            print(
+                "[WARN] Invalid static activation quant state detected; "
+                f"falling back to float passthrough for {debug_name!r}. "
+                f"reason={reason!r} input_shape={tuple(x.shape)} "
+                f"n_bits={self.n_bits}"
+            )
+            setattr(self, "_invalid_static_quant_warned", True)
+
+        self.enable = False
+        self.is_observing = False
+        self.observered = False
+        self.is_dynamic_quant = False
+        return x
+    
 
     def forward(self, x: torch.Tensor):
         # No-op for high precision or disabled quantization
@@ -335,6 +443,10 @@ class UniformAffineQuantizer(nn.Module):
                     self.observered = True
                     self.observer = None
 
+                ready, reason = self._validate_static_act_quant_ready(x)
+                if not ready:
+                    return self._handle_invalid_static_act_quant(x, reason)
+
                 x_dequant = self.fake_quant(x, self.scale, self.round_zero_point)
                 return x_dequant.type_as(x)
 
@@ -346,7 +458,8 @@ class UniformAffineQuantizer(nn.Module):
 
         x_dequant = self.fake_quant(x, self.scale, self.round_zero_point)
         return x_dequant.type_as(x)
-
+    
+    
     # ------------------------------------------------------------------
     # Calibration helpers
     # ------------------------------------------------------------------
@@ -577,3 +690,4 @@ if __name__ == "__main__":
     weight_quant = quantizer(weight)
     diff = weight - weight_quant
     print(diff.sum())
+

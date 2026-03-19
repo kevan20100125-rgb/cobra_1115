@@ -7,7 +7,7 @@ from .quantizer import UniformAffineQuantizer
 
 class QuantLinear(nn.Linear):
     """
-    Quantized Linear module (MambaQuant-style fake quant).
+    Quantized Linear module (PTQ-style fake quant).
 
     - Wraps an existing nn.Linear.
     - Uses UniformAffineQuantizer for:
@@ -158,3 +158,4 @@ class QuantLinear(nn.Linear):
             self.weight_quantizer.change_n_bits(weight_bits)
         if act_bits is not None and self.act_quantizer is not None:
             self.act_quantizer.change_n_bits(act_bits)
+

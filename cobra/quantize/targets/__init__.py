@@ -1,0 +1,31 @@
+from .target_registry import (
+    CANONICAL_TARGETS,
+    CANONICAL_TARGET_SET,
+    LEGACY_TARGET_ALIASES,
+    TARGET_LLM,
+    TARGET_PROJECTOR,
+    TARGET_VISION_DINO,
+    TARGET_VISION_SIGLIP,
+    TargetFlags,
+    infer_target_from_module_path,
+    is_canonical_target,
+    normalize_target,
+    normalize_targets,
+    validate_targets,
+)
+
+__all__ = [
+    "CANONICAL_TARGETS",
+    "CANONICAL_TARGET_SET",
+    "LEGACY_TARGET_ALIASES",
+    "TARGET_LLM",
+    "TARGET_PROJECTOR",
+    "TARGET_VISION_DINO",
+    "TARGET_VISION_SIGLIP",
+    "TargetFlags",
+    "infer_target_from_module_path",
+    "is_canonical_target",
+    "normalize_target",
+    "normalize_targets",
+    "validate_targets",
+]

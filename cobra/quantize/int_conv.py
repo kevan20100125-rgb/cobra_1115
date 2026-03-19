@@ -7,7 +7,7 @@ from .quantizer import UniformAffineQuantizer
 
 class QuantConv1d(nn.Conv1d):
     """
-    Quantized 1D convolution (MambaQuant-style fake quant).
+    Quantized 1D convolution (PTQ-style fake quant).
 
     - Wraps an existing nn.Conv1d.
     - Uses UniformAffineQuantizer for:
@@ -174,7 +174,7 @@ class QuantConv1d(nn.Conv1d):
 
 class QuantConv2d(nn.Conv2d):
     """
-    Quantized 2D convolution (MambaQuant-style fake quant).
+    Quantized 2D convolution (PTQ-style fake quant).
 
     Same design as QuantConv1d, but for nn.Conv2d.
     """
@@ -315,7 +315,7 @@ class QuantConv2d(nn.Conv2d):
 
 class QuantConv3d(nn.Conv3d):
     """
-    Quantized 3D convolution (MambaQuant-style fake quant).
+    Quantized 3D convolution (PTQ-style fake quant).
 
     Same design as QuantConv1d/2d, but for nn.Conv3d.
     """
@@ -452,3 +452,4 @@ class QuantConv3d(nn.Conv3d):
             self.weight_quantizer.change_n_bits(weight_bits)
         if act_bits is not None and self.act_quantizer is not None:
             self.act_quantizer.change_n_bits(act_bits)
+

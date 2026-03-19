@@ -68,3 +68,27 @@ cobra_1115_*.zip
 *.tar.gz
 
 .hf_token
+
+# Phase 5 repo hygiene
+.git/
+outputs/
+outputs/**
+
+# Quant artifacts
+*.pt
+*.pth
+*.ckpt
+*.bin
+*.npz
+*.npy
+
+# Runtime / cache
+__pycache__/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Logs
+*.out
+*.err
+*.log

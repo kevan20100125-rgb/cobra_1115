@@ -1,160 +1,223 @@
-# cobra/quantize/runtime/config.py
-
-"""
-runtime/config.py
-
-Centralized runtime quantization configuration for Cobra PTQ.
-
-Design goal (Phase 2+):
-    - All decisions about bits / backend / targets / modes should come from
-      QuantRuntimeConfig, and only from here.
-    - The following entrypoints must treat QuantRuntimeConfig as the single
-      source of truth:
-          * switches/quant_calibrate.py
-          * switches/quant_finalize.py
-          * quantize/runtime/load_quantized_vlm.py
-    - Scripts and CLIs should NOT re-parse bits or re-decide target sets
-      on their own; instead they should:
-          1) build QuantRuntimeConfig via from_bits_backend(...)
-          2) read weight_bits / act_bits / mode / use_pct_for / use_rotation_for
-             / projector_rotation_mode from quant_cfg
-          3) pass those settings into wrap / calibrator / rotate / export.
-"""
-
 from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import Enum, unique
-from typing import Optional, Iterable, Set, Tuple
+from typing import Iterable, Optional, Set, Tuple
 
+from cobra.quantize.targets import CANONICAL_TARGETS, normalize_targets
 
-_CANONICAL_TARGETS = ("vision.dino", "vision.siglip", "llm", "projector")
 _SUPPORTED_BITS = (2, 4, 8, 16)
-
 
 @unique
 class QuantMode(Enum):
-    FLOAT = "float"         # 完全不量化（baseline）
-    FAKE = "fake"           # fake quant（MambaQuant-style，仍用 float kernel）
+    FLOAT = "float"
+    FAKE = "fake"
 
 
 @unique
 class ProjectorRotationMode(Enum):
-    """
-    控制 LLM output projector（lm_head）的旋轉模式。
-
-    - HK       : KLT + Hadamard
-    - HADAMARD : 只有 Hadamard
-    - NONE     : 完全不旋轉（即使 use_rotation_for 包含 projector）
-    """
     HK = "hk"
     HADAMARD = "hadamard"
     NONE = "none"
 
 
+@dataclass(frozen=True)
+class ModelIdResolution:
+    raw_model_id: str
+    base_model_id: str
+    backend: str
+    bits_hint: Optional[str]
+
+
+@dataclass(frozen=True)
+class RuntimeRequestResolution:
+    raw_model_id: str
+    base_model_id: str
+    backend: str
+    bits: Optional[str]
+    bits_hint: Optional[str]
+
+
+def normalize_bits_spec(bits: Optional[str]) -> Optional[str]:
+    if bits is None:
+        return None
+    s = str(bits).strip().upper()
+    return s or None
+
+
+def parse_flexible_bits_spec(bits: Optional[str], *, strict: bool = False) -> Tuple[Optional[int], Optional[int]]:
+    """
+    Supported:
+      - None
+      - W8 / W4 / W2 / W16
+      - W8A8 / W4A8 / W2A2 / ...
+      - A8 / A16
+    """
+    import re
+
+    s = normalize_bits_spec(bits)
+    if s is None:
+        return None, None
+
+    m = re.fullmatch(r"W(\d+)A(\d+)", s)
+    if m is not None:
+        w_bits = int(m.group(1))
+        a_bits = int(m.group(2))
+        if w_bits in _SUPPORTED_BITS and a_bits in _SUPPORTED_BITS:
+            return w_bits, a_bits
+        if strict:
+            raise ValueError(
+                f"[parse_flexible_bits_spec] Unsupported bits spec {bits!r}; "
+                f"supported bitwidths are {_SUPPORTED_BITS}."
+            )
+        return None, None
+
+    m = re.fullmatch(r"W(\d+)", s)
+    if m is not None:
+        w_bits = int(m.group(1))
+        if w_bits in _SUPPORTED_BITS:
+            return w_bits, None
+        if strict:
+            raise ValueError(
+                f"[parse_flexible_bits_spec] Unsupported weight bits {bits!r}; "
+                f"supported bitwidths are {_SUPPORTED_BITS}."
+            )
+        return None, None
+
+    m = re.fullmatch(r"A(\d+)", s)
+    if m is not None:
+        a_bits = int(m.group(1))
+        if a_bits in _SUPPORTED_BITS:
+            return None, a_bits
+        if strict:
+            raise ValueError(
+                f"[parse_flexible_bits_spec] Unsupported activation bits {bits!r}; "
+                f"supported bitwidths are {_SUPPORTED_BITS}."
+            )
+        return None, None
+
+    if strict:
+        raise ValueError(
+            f"[parse_flexible_bits_spec] Invalid bits spec {bits!r}; "
+            "expected one of: W8, W4A8, A8, etc."
+        )
+    return None, None
+
+
+def resolve_model_id_base_backend(model_id: str) -> ModelIdResolution:
+    """
+    Examples:
+      cobra+3b
+      cobra+3b-ptq-w8-fake
+      cobra+3b-ptq-w8a8-fake
+      cobra+3b-ptq-a8-fake
+    """
+    raw = str(model_id).strip()
+    lower = raw.lower()
+
+    backend = "float"
+    base_for_bits = raw
+
+    if lower.endswith("-fake"):
+        backend = "fake"
+        base_for_bits = raw[:-5]
+
+    lower2 = base_for_bits.lower()
+    if "-ptq-" not in lower2:
+        return ModelIdResolution(
+            raw_model_id=raw,
+            base_model_id=base_for_bits,
+            backend=backend,
+            bits_hint=None,
+        )
+
+    idx = lower2.index("-ptq-")
+    base_id = base_for_bits[:idx]
+    bits_hint = normalize_bits_spec(base_for_bits[idx + len("-ptq-") :])
+
+    return ModelIdResolution(
+        raw_model_id=raw,
+        base_model_id=base_id,
+        backend=backend,
+        bits_hint=bits_hint,
+    )
+
+
+def resolve_runtime_request(
+    *,
+    raw_model_id: str,
+    env_bits: Optional[str] = None,
+    env_backend: Optional[str] = None,
+) -> RuntimeRequestResolution:
+    """
+    Precedence:
+      backend: env BACKEND > model_id suffix > float
+      bits:    env BITS > model_id -ptq-<bits> suffix > None
+    """
+    model_res = resolve_model_id_base_backend(raw_model_id)
+
+    backend = (env_backend or "").strip().lower()
+    if backend not in ("float", "fake"):
+        backend = model_res.backend
+
+    bits = normalize_bits_spec(env_bits)
+    if bits is None:
+        bits = model_res.bits_hint
+
+    return RuntimeRequestResolution(
+        raw_model_id=model_res.raw_model_id,
+        base_model_id=model_res.base_model_id,
+        backend=backend,
+        bits=bits,
+        bits_hint=model_res.bits_hint,
+    )
+
+
 @dataclass
 class QuantRuntimeConfig:
     """
-    集中管理 Cobra PTQ runtime 相關設定的物件。
+    Single source of truth for resolved quant runtime configuration.
 
-    設計目標：
-        - bits/backend/vision_in_pct_pipeline 等不要散落在各個 script。
-        - 任何需要量化設定的地方（wrap/pct/finalize/runtime）統一吃這個 config。
+    Notes:
+      - requested_* means the user actually asked for that quant branch.
+      - weight_bits / act_bits remain "effective" bit placeholders for compatibility.
+        If a branch is not requested, the effective value is 16 (float-like).
     """
 
-    # 使用者視角
-    bits: Optional[str]                      # 原始字串："W4A4" / "W8A8" / None (表示 float)
-    weight_bits: int                         # 內部解析後的 W bits
-    act_bits: int                            # 內部解析後的 A bits
-    mode: QuantMode                          # FLOAT / FAKE
+    bits: Optional[str]
+    requested_weight_bits: Optional[int]
+    requested_act_bits: Optional[int]
 
-    # 哪些 target 進 percentile / quant 流程
+    weight_bits: int
+    act_bits: int
+
+    mode: QuantMode
+
     use_pct_for: Set[str] = field(default_factory=set)
-    # 哪些 target 允許「旋轉」；目前實務上只支援 "projector"
     use_rotation_for: Set[str] = field(default_factory=set)
 
-    # projector rotation 模式（HK / HADAMARD / NONE）
     projector_rotation_mode: ProjectorRotationMode = ProjectorRotationMode.HK
 
-    # 額外旗標
     vision_in_pct_pipeline: bool = True
     enable_act_quant: bool = False
     symmetric_acts: bool = True
     symmetric_weights: bool = True
 
-    # 方便 logging / debug
     config_name: Optional[str] = None
-
-    # 原始 backend 字串，可選（"fake"/"int"/"float"）
     backend: Optional[str] = None
-
-    # ------------------------------------------------------------------
-    # 建構 helper
-    # ------------------------------------------------------------------
-    @staticmethod
-    def _parse_bits(bits: Optional[str]) -> Tuple[int, int]:
-        """
-        將 "W8A4" 等字串轉成 (w_bits, a_bits)。
-
-        若 bits 為 None，代表 float 路徑（W16A16 當作預設）。
-        """
-        if bits is None:
-            # 對 float 路徑統一視作 W16A16，方便下游簡單判斷
-            return 16, 16
-
-        s = bits.strip()
-        # 支援大小寫混用
-        # 形式：W8A8 / w4a8 等
-        import re
-
-        m = re.fullmatch(r"[Ww](\d+)[Aa](\d+)", s)
-        if m is None:
-            raise ValueError(
-                f"[QuantRuntimeConfig] Invalid bits spec {bits!r}; "
-                f"expected like 'W8A8', 'W4A4'."
-            )
-
-        w_bits = int(m.group(1))
-        a_bits = int(m.group(2))
-
-        if w_bits not in _SUPPORTED_BITS or a_bits not in _SUPPORTED_BITS:
-            raise ValueError(
-                f"[QuantRuntimeConfig] Unsupported bitwidth combo W{w_bits}A{a_bits}; "
-                f"supported bitwidths are {_SUPPORTED_BITS} for both W and A."
-            )
-        return w_bits, a_bits
 
     @staticmethod
     def _normalize_targets(targets: Optional[Iterable[str]]) -> Set[str]:
-        if not targets:
-            return set()
-        out: Set[str] = set()
-        for t in targets:
-            t = (t or "").strip()
-            if not t:
-                continue
-            if t not in _CANONICAL_TARGETS:
-                raise KeyError(
-                    f"[QuantRuntimeConfig] Unknown canonical target {t!r}. "
-                    f"Expected one of {_CANONICAL_TARGETS}."
-                )
-            out.add(t)
-        return out
+        try:
+            return set(normalize_targets(targets))
+        except KeyError as e:
+            raise KeyError(
+                f"[QuantRuntimeConfig] Invalid canonical target in {targets!r}. "
+                f"Expected one of {CANONICAL_TARGETS}."
+            ) from e
 
     @staticmethod
-    def _parse_projector_rotation_mode(
-        mode: Optional[str],
-    ) -> ProjectorRotationMode:
-        """
-        將使用者提供的 rotation mode 字串（或 None）轉成 enum。
-
-        合法字串：
-            - "hk", "klt+hadamard", "klt_hadamard"
-            - "hadamard", "h"
-            - "none", "off", "disable", "disabled"
-
-        若為 None，視為 "hk"。
-        """
+    def _parse_projector_rotation_mode(mode: Optional[str]) -> ProjectorRotationMode:
         if mode is None:
             return ProjectorRotationMode.HK
 
@@ -168,7 +231,7 @@ class QuantRuntimeConfig:
 
         raise ValueError(
             f"[QuantRuntimeConfig] Unknown projector_rotation_mode={mode!r}; "
-            "expected one of ['hk', 'hadamard', 'none'] (with a few aliases)."
+            "expected one of ['hk', 'hadamard', 'none']."
         )
 
     @classmethod
@@ -187,36 +250,24 @@ class QuantRuntimeConfig:
         config_name: Optional[str] = None,
         projector_rotation_mode: Optional[str] = "hk",
         enable_act_quant: bool = False,
+        strict_bits: bool = True,
     ) -> "QuantRuntimeConfig":
-        """
-        Build QuantRuntimeConfig from bits/backend and switches.
-
-        Stage 1 requirement:
-            - activation must remain float
-            - pct_hi_lo must NOT be required
-            - calibration must be skipped
-
-        Control knob:
-            enable_act_quant:
-                - False => Stage 1 W-only (skip activation calibration)
-                - True  => later stages (allow calibration)
-        """
-        backend_norm = (backend or "float").lower()
+        backend_norm = (backend or "float").strip().lower()
         if backend_norm not in ("float", "fake"):
             raise ValueError(
                 f"[QuantRuntimeConfig] Unsupported backend={backend!r}; "
-                f"expected 'float', 'fake'."
+                "expected 'float' or 'fake'."
             )
 
-        w_bits, a_bits = cls._parse_bits(bits)
+        bits_norm = normalize_bits_spec(bits)
+        req_w_bits, req_a_bits = parse_flexible_bits_spec(bits_norm, strict=strict_bits)
         proj_rot_mode_enum = cls._parse_projector_rotation_mode(projector_rotation_mode)
 
-        if backend_norm == "float":
-            mode = QuantMode.FLOAT
-        else:
-            mode = QuantMode.FAKE
+        mode = QuantMode.FLOAT if backend_norm == "float" else QuantMode.FAKE
 
-        # Which targets enter quant pipeline (wrapping decision still uses this set)
+        effective_w_bits = req_w_bits if req_w_bits is not None else 16
+        effective_a_bits = req_a_bits if req_a_bits is not None else 16
+
         use_pct_for: Set[str] = set()
         if mode is not QuantMode.FLOAT:
             if enable_vision_dino:
@@ -232,7 +283,6 @@ class QuantRuntimeConfig:
             use_pct_for.discard("vision.dino")
             use_pct_for.discard("vision.siglip")
 
-        # Rotation gating (Stage 1 will set projector_rotation_mode="none" via script)
         use_rotation_for: Set[str] = set()
         if (
             mode is not QuantMode.FLOAT
@@ -242,82 +292,53 @@ class QuantRuntimeConfig:
             use_rotation_for.add("projector")
 
         return cls(
-            bits=bits,
-            weight_bits=w_bits,
-            act_bits=a_bits,
+            bits=bits_norm,
+            requested_weight_bits=req_w_bits,
+            requested_act_bits=req_a_bits,
+            weight_bits=effective_w_bits,
+            act_bits=effective_a_bits,
             mode=mode,
             use_pct_for=use_pct_for,
             use_rotation_for=use_rotation_for,
             projector_rotation_mode=proj_rot_mode_enum,
             vision_in_pct_pipeline=vision_in_pct_pipeline,
+            enable_act_quant=enable_act_quant,
             symmetric_acts=symmetric_acts,
             symmetric_weights=symmetric_weights,
             config_name=config_name,
             backend=backend_norm,
-            enable_act_quant=enable_act_quant,
         )
 
-
-    # ------------------------------------------------------------------
-    # Convenience helpers
-    # ------------------------------------------------------------------
     def enabled_targets(self) -> Tuple[str, ...]:
-        """回傳會進 percentile / quant 流程的 target（排序後）。"""
         return tuple(sorted(self.use_pct_for))
 
     def should_quantize_target(self, target: str) -> bool:
-        """該 target 是否會進 percentile / quant pipeline。"""
         return target in self.use_pct_for
 
     def should_rotate_projector(self) -> bool:
-        """
-        回傳是否允許對 projector（LLM output head）套用 rotation。
-
-        條件（集中在這裡統一判斷）：
-            - mode 為 FAKE 或 INT_EXPORT（非 FLOAT）
-            - use_rotation_for 包含 "projector"
-            - projector_rotation_mode 不是 NONE
-
-        後續若要讓某些 bits/組合禁用 projector rotation，也應該透過
-        from_bits_backend(...) 或額外 flag 來影響：
-            - self.mode
-            - self.use_rotation_for
-            - self.projector_rotation_mode
-        而不是讓下游自行再判斷。
-        """
         if self.mode is QuantMode.FLOAT:
             return False
-
         return (
             "projector" in self.use_rotation_for
             and self.projector_rotation_mode is not ProjectorRotationMode.NONE
         )
-    def should_calibrate_activations(self) -> bool:
-        """
-        Stage-gated activation calibration switch.
 
-        Stage 1 (W-only baseline):
-            - enable_act_quant must be False
-            - calibration MUST be skipped
-        """
-        return (self.mode is not QuantMode.FLOAT) and bool(self.enable_act_quant)
+    def should_apply_weight_quant(self) -> bool:
+        return (self.mode is not QuantMode.FLOAT) and (self.requested_weight_bits is not None)
+
+    def should_calibrate_activations(self) -> bool:
+        return (
+            (self.mode is not QuantMode.FLOAT)
+            and bool(self.enable_act_quant)
+            and (self.requested_act_bits is not None)
+        )
 
     def projector_rotation_uses_klt(self) -> bool:
-        """
-        目前設定下，projector rotation 是否會使用 KLT。
-
-        僅在「本來就會旋轉 projector」的前提下才有意義，否則一律視為 False。
-        """
         if not self.should_rotate_projector():
             return False
         return self.projector_rotation_mode is ProjectorRotationMode.HK
 
     def projector_rotation_uses_hadamard(self) -> bool:
-        """
-        目前設定下，projector rotation 是否會使用 Hadamard。
-
-        僅在「本來就會旋轉 projector」的前提下才有意義，否則一律視為 False。
-        """
         if not self.should_rotate_projector():
             return False
         return self.projector_rotation_mode in (
@@ -325,5 +346,24 @@ class QuantRuntimeConfig:
             ProjectorRotationMode.HADAMARD,
         )
 
+    def requested_bits_label(self) -> str:
+        if self.requested_weight_bits is not None and self.requested_act_bits is not None:
+            return f"W{self.requested_weight_bits}A{self.requested_act_bits}"
+        if self.requested_weight_bits is not None:
+            return f"W{self.requested_weight_bits}"
+        if self.requested_act_bits is not None:
+            return f"A{self.requested_act_bits}"
+        return "FLOAT"
 
-
+    def effective_bits_label(self, *, act_calib_enabled: Optional[bool] = None) -> str:
+        parts = []
+        if self.requested_weight_bits is not None:
+            parts.append(f"W{self.requested_weight_bits}")
+        if self.requested_act_bits is not None:
+            if act_calib_enabled is None:
+                parts.append(f"A{self.requested_act_bits}")
+            elif act_calib_enabled:
+                parts.append(f"A{self.requested_act_bits}")
+            else:
+                parts.append(f"A{self.requested_act_bits}(OFF)")
+        return "".join(parts) if parts else "FLOAT"

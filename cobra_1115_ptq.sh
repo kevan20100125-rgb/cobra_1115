@@ -12,165 +12,166 @@
 
 set -euo pipefail
 
-# ==============================
-# 1. 環境設定
-# ==============================
 module load cuda/12.4
 
-# conda activate under nounset-safe wrapper
 set +u
 source /work/asdf1234/miniconda3/etc/profile.d/conda.sh
 conda activate cobra
 set -u
 
-# ==============================
-# 2. 專案位址 / PYTHONPATH
-# ==============================
-# 預設以當前工作目錄為 cobra_1115 根目錄；可由外部覆寫
+normalize_bool_01() {
+  local raw="${1:-}"
+  raw="$(echo "${raw}" | tr 'A-Z' 'a-z')"
+  case "${raw}" in
+    1|true|yes|y|on) echo "1" ;;
+    0|false|no|n|off) echo "0" ;;
+    *)
+      echo "[ERROR] Invalid boolean value: ${1}" >&2
+      exit 1
+      ;;
+  esac
+}
+
 export COBRA_1115_ROOT="${COBRA_1115_ROOT:-$(pwd)}"
 cd "${COBRA_1115_ROOT}"
-
 export PYTHONPATH="${COBRA_1115_ROOT}:${PYTHONPATH:-}"
 
-# Cache 位置（可視環境調整）
 export HF_HOME="${HF_HOME:-${HOME}/.cache/huggingface}"
 export TRANSFORMERS_CACHE="${TRANSFORMERS_CACHE:-${HF_HOME}}"
 export HF_DATASETS_CACHE="${HF_DATASETS_CACHE:-${HF_HOME}}"
 
-# ==============================
-# 3. 入口參數（只保留 klt / calibrate）
-# ==============================
-# MODE:
-#   klt       -> 只跑 quant_klt（產生 shared_klt.pt）
-#   calibrate -> 只跑 quant_calibrate（產生 pct_stats / pct_hi_lo / summary）
-#   full      -> calibrate + klt
-MODE="${MODE:-full}"
-
-# BITS: 例如 W8A8 / W4A4 / W16A16（quant_calibrate 用）
+MODE="${MODE:-calibrate}"          # calibrate | act_klt
 BITS="${BITS:-W8A8}"
-
-# SMOKE:
-#   1 -> smoke test（極少 batch 驗證流程）
-#   0 -> 正式校正（使用 QuantCalibrateConfig 的預設為主）
-SMOKE="${SMOKE:-0}"
-
-# quant_calibrate 的 backend：你目前 repo 只保留 float/fake runtime；校正應走 fake
+SMOKE="${SMOKE:-1}"
 BACKEND="${BACKEND:-fake}"
+STAGE="${STAGE:-finetune}"
+HF_TOKEN_PATH="${HF_TOKEN_PATH:-.hf_token}"
+
+export COBRA_LLM_ACT_MODE="${COBRA_LLM_ACT_MODE:-mamba_sensitive}"
+LLM_ACT_MODE_TAG="$(echo "${COBRA_LLM_ACT_MODE}" | tr 'A-Z' 'a-z')"
+
+MAMBA_SENSITIVE_IN_PROJ_RAW="${MAMBA_SENSITIVE_IN_PROJ:-0}"
+MAMBA_SENSITIVE_X_PROJ_RAW="${MAMBA_SENSITIVE_X_PROJ:-0}"
+MAMBA_SENSITIVE_DT_PROJ_RAW="${MAMBA_SENSITIVE_DT_PROJ:-0}"
+MAMBA_SENSITIVE_OUT_PROJ_RAW="${MAMBA_SENSITIVE_OUT_PROJ:-1}"
+
+MAMBA_SENSITIVE_IN_PROJ="$(normalize_bool_01 "${MAMBA_SENSITIVE_IN_PROJ_RAW}")"
+MAMBA_SENSITIVE_X_PROJ="$(normalize_bool_01 "${MAMBA_SENSITIVE_X_PROJ_RAW}")"
+MAMBA_SENSITIVE_DT_PROJ="$(normalize_bool_01 "${MAMBA_SENSITIVE_DT_PROJ_RAW}")"
+MAMBA_SENSITIVE_OUT_PROJ="$(normalize_bool_01 "${MAMBA_SENSITIVE_OUT_PROJ_RAW}")"
+
+export COBRA_LLM_MAMBA_SENSITIVE_IN_PROJ="${MAMBA_SENSITIVE_IN_PROJ}"
+export COBRA_LLM_MAMBA_SENSITIVE_X_PROJ="${MAMBA_SENSITIVE_X_PROJ}"
+export COBRA_LLM_MAMBA_SENSITIVE_DT_PROJ="${MAMBA_SENSITIVE_DT_PROJ}"
+export COBRA_LLM_MAMBA_SENSITIVE_OUT_PROJ="${MAMBA_SENSITIVE_OUT_PROJ}"
+
+MAMBA_SENSITIVE_PROJ_TAG="in${MAMBA_SENSITIVE_IN_PROJ}_x${MAMBA_SENSITIVE_X_PROJ}_dt${MAMBA_SENSITIVE_DT_PROJ}_out${MAMBA_SENSITIVE_OUT_PROJ}"
+if [[ "${LLM_ACT_MODE_TAG}" == "mamba_sensitive" ]]; then
+  LLM_ACT_CONFIG_TAG="${LLM_ACT_MODE_TAG}_${MAMBA_SENSITIVE_PROJ_TAG}"
+else
+  LLM_ACT_CONFIG_TAG="${LLM_ACT_MODE_TAG}"
+fi
+
 case "${BACKEND}" in
   fake) ;;
   *)
-    echo "[ERROR] BACKEND must be 'fake' for quant_calibrate. Got: ${BACKEND}"
+    echo "[ERROR] BACKEND must be 'fake' for cobra_1115_ptq.sh. Got: ${BACKEND}" >&2
     exit 1
     ;;
 esac
 
-# quant_klt stage（QuantKLTConfig 預設 finetune；可覆寫）
-STAGE="${STAGE:-finetune}"
+case "${MODE}" in
+  calibrate|act_klt) ;;
+  *)
+    echo "[ERROR] MODE must be 'calibrate' or 'act_klt'. Got: ${MODE}" >&2
+    exit 1
+    ;;
+esac
 
-# HF token（quant_klt 會用到；QuantKLTConfig 預設 .hf_token）
-HF_TOKEN_PATH="${HF_TOKEN_PATH:-${COBRA_1115_ROOT}/.hf_token}"
+if [[ ! -f "${HF_TOKEN_PATH}" ]]; then
+  echo "[ERROR] HF_TOKEN_PATH not found: ${HF_TOKEN_PATH}" >&2
+  exit 1
+fi
 
 mkdir -p outputs/slurm outputs/quantize
 
-# ==============================
-# 4. 輸出路徑（僅保留 pct 與 klt）
-# ==============================
-PCT_STATS="${PCT_STATS:-outputs/quantize/pct_stats_${BITS}.pt}"
-PCT_HI_LO="${PCT_HI_LO:-outputs/quantize/pct_hi_lo_${BITS}.pt}"
-PCT_SUMMARY="${PCT_SUMMARY:-outputs/quantize/pct_calibrate_summary_${BITS}.json}"
+PCT_STATS_OUT="${PCT_STATS_OUT:-outputs/quantize/pct_stats_${BITS}_${LLM_ACT_CONFIG_TAG}.pt}"
+PCT_HI_LO_PATH="${PCT_HI_LO_PATH:-outputs/quantize/pct_hi_lo_${BITS}_${LLM_ACT_CONFIG_TAG}.pt}"
+PCT_SUMMARY_OUT="${PCT_SUMMARY_OUT:-outputs/quantize/pct_calibrate_summary_${BITS}_${LLM_ACT_CONFIG_TAG}.json}"
 
-# shared KLT（QuantKLTConfig 預設是 cobra.quantize.rotate.projector.SHARED_KLT_PATH）
-# 這裡提供可覆寫的統一出口，避免硬編碼絕對路徑卡住不同機器
-KLT_OUT="${KLT_OUT:-outputs/quantize/shared_klt.pt}"
-# ==============================
-export MODE
-export BITS
-export SMOKE
-export BACKEND
-export STAGE
-export HF_TOKEN_PATH
-export PCT_STATS
-export PCT_HI_LO
-export PCT_SUMMARY
-export KLT_OUT
-# ==============================
-echo "[INFO] COBRA_1115_ROOT=${COBRA_1115_ROOT}"
-echo "[INFO] MODE=${MODE}, BITS=${BITS}, BACKEND=${BACKEND}, SMOKE=${SMOKE}, STAGE=${STAGE}"
-echo "[INFO] PCT_STATS=${PCT_STATS}"
-echo "[INFO] PCT_HI_LO=${PCT_HI_LO}"
-echo "[INFO] PCT_SUMMARY=${PCT_SUMMARY}"
-echo "[INFO] KLT_OUT=${KLT_OUT}"
-echo "[INFO] HF_TOKEN_PATH=${HF_TOKEN_PATH}"
+ACT_KLT_BLOCK_SIZE="${ACT_KLT_BLOCK_SIZE:-512}"
+ACT_KLT_OUTPROJ_IN="${ACT_KLT_OUTPROJ_IN:-outputs/quantize/act_klt_outproj_in_bs${ACT_KLT_BLOCK_SIZE}/act_klt_outproj_in.pt}"
+ACT_KLT_OUTPROJ_OUT="${ACT_KLT_OUTPROJ_OUT:-outputs/quantize/act_klt_outproj_out_bs${ACT_KLT_BLOCK_SIZE}/act_klt_outproj_out.pt}"
+ACT_KLT_EXPORT_OUT_FEATURE="${ACT_KLT_EXPORT_OUT_FEATURE:-1}"
+ACT_KLT_MAX_BATCHES="${ACT_KLT_MAX_BATCHES:-0}"
+ACT_KLT_MAX_TOKENS="${ACT_KLT_MAX_TOKENS:-128}"
 
-# ==============================
-# 5. KLT（quant_klt）
-# ==============================
-if [[ "${MODE}" == "klt" || "${MODE}" == "full" ]]; then
-  echo "[STEP] Running cobra_1115 quant_klt ..."
-
-  python - << '__PY__'
-import os
-from pathlib import Path
-
-from cobra.switches.quant_klt import QuantKLTConfig, quant_klt
-
-STAGE = os.environ.get("STAGE", "finetune")
-HF_TOKEN_PATH = Path(os.environ.get("HF_TOKEN_PATH", ".hf_token"))
-KLT_OUT = Path(os.environ.get("KLT_OUT", "outputs/quantize/shared_klt.pt"))
-
-cfg = QuantKLTConfig(
-    stage=STAGE,
-    hf_token=HF_TOKEN_PATH,
-    klt_out=KLT_OUT,
-)
-
-print(
-    f"[QuantKLT] Running with stage={cfg.stage}, device={cfg.device}, "
-    f"klt_out={cfg.klt_out}, hf_token={cfg.hf_token}"
-)
-quant_klt(cfg)
-__PY__
-
-  echo "[STEP] KLT finished. Saved -> ${KLT_OUT}"
+if [[ "${MODE}" == "act_klt" ]]; then
+  export COBRA_ACT_KLT_EXPORT="${COBRA_ACT_KLT_EXPORT:-1}"
+else
+  export COBRA_ACT_KLT_EXPORT="${COBRA_ACT_KLT_EXPORT:-0}"
 fi
 
-# ==============================
-# 6. Calibration（quant_calibrate）
-# ==============================
-if [[ "${MODE}" == "calibrate" || "${MODE}" == "full" ]]; then
-  echo "[STEP] Running cobra_1115 quant_calibrate ..."
+export MODE BITS SMOKE BACKEND STAGE HF_TOKEN_PATH
+export PCT_STATS_OUT PCT_HI_LO_PATH PCT_SUMMARY_OUT
+export ACT_KLT_OUTPROJ_IN ACT_KLT_OUTPROJ_OUT
+export ACT_KLT_EXPORT_OUT_FEATURE
+export ACT_KLT_BLOCK_SIZE ACT_KLT_MAX_BATCHES ACT_KLT_MAX_TOKENS
+export LLM_ACT_MODE_TAG LLM_ACT_CONFIG_TAG
+export MAMBA_SENSITIVE_IN_PROJ MAMBA_SENSITIVE_X_PROJ
+export MAMBA_SENSITIVE_DT_PROJ MAMBA_SENSITIVE_OUT_PROJ
+export MAMBA_SENSITIVE_PROJ_TAG
 
-  python - << '__PY__'
+echo "[INFO] COBRA_1115_ROOT=${COBRA_1115_ROOT}"
+echo "[INFO] MODE=${MODE}, BITS=${BITS}, BACKEND=${BACKEND}, SMOKE=${SMOKE}, STAGE=${STAGE}"
+echo "[INFO] COBRA_LLM_ACT_MODE=${COBRA_LLM_ACT_MODE}"
+echo "[INFO] LLM_ACT_MODE_TAG=${LLM_ACT_MODE_TAG}"
+echo "[INFO] LLM_ACT_CONFIG_TAG=${LLM_ACT_CONFIG_TAG}"
+echo "[INFO] COBRA_LLM_MAMBA_SENSITIVE_IN_PROJ=${COBRA_LLM_MAMBA_SENSITIVE_IN_PROJ}"
+echo "[INFO] COBRA_LLM_MAMBA_SENSITIVE_X_PROJ=${COBRA_LLM_MAMBA_SENSITIVE_X_PROJ}"
+echo "[INFO] COBRA_LLM_MAMBA_SENSITIVE_DT_PROJ=${COBRA_LLM_MAMBA_SENSITIVE_DT_PROJ}"
+echo "[INFO] COBRA_LLM_MAMBA_SENSITIVE_OUT_PROJ=${COBRA_LLM_MAMBA_SENSITIVE_OUT_PROJ}"
+echo "[INFO] MAMBA_SENSITIVE_PROJ_TAG=${MAMBA_SENSITIVE_PROJ_TAG}"
+echo "[INFO] PCT_STATS_OUT=${PCT_STATS_OUT}"
+echo "[INFO] PCT_HI_LO_PATH=${PCT_HI_LO_PATH}"
+echo "[INFO] PCT_SUMMARY_OUT=${PCT_SUMMARY_OUT}"
+echo "[INFO] ACT_KLT_OUTPROJ_IN=${ACT_KLT_OUTPROJ_IN}"
+echo "[INFO] ACT_KLT_OUTPROJ_OUT=${ACT_KLT_OUTPROJ_OUT}"
+echo "[INFO] ACT_KLT_BLOCK_SIZE=${ACT_KLT_BLOCK_SIZE}"
+echo "[INFO] ACT_KLT_MAX_BATCHES=${ACT_KLT_MAX_BATCHES}"
+echo "[INFO] ACT_KLT_MAX_TOKENS=${ACT_KLT_MAX_TOKENS}"
+echo "[INFO] HF_TOKEN_PATH=${HF_TOKEN_PATH}"
+echo "[INFO] COBRA_ACT_KLT_EXPORT=${COBRA_ACT_KLT_EXPORT}"
+
+if [[ "${MODE}" == "calibrate" ]]; then
+  python - <<'PY'
 import os
 from pathlib import Path
 
-from cobra.switches.quant_calibrate import QuantCalibrateConfig, quant_calibrate
 from cobra.conf.datasets import DatasetConfig, DatasetRegistry
+from cobra.switches.quant_calibrate import QuantCalibrateConfig, quant_calibrate
 
-BITS = os.environ.get("BITS", "W8A8")
-BACKEND = os.environ.get("BACKEND", "fake")
-SMOKE = int(os.environ.get("SMOKE", "0"))
+bits = os.environ.get("BITS", "W8A8")
+backend = os.environ.get("BACKEND", "fake")
+smoke = int(os.environ.get("SMOKE", "1"))
+llm_act_mode = os.environ.get("COBRA_LLM_ACT_MODE", "default")
+llm_act_config_tag = os.environ.get("LLM_ACT_CONFIG_TAG", llm_act_mode)
 
-pct_stats_out = Path(os.environ["PCT_STATS"])
-pct_hi_lo_out = Path(os.environ["PCT_HI_LO"])
-pct_summary_out = Path(os.environ["PCT_SUMMARY"])
-
-# 預設 calibration dataset：TEXTVQA_100_CALIB
 calib_cfg_cls = DatasetConfig.get_choice_class(
     DatasetRegistry.TEXTVQA_100_CALIB.dataset_id
 )
 calib_dataset_cfg = calib_cfg_cls()
 
 base_cfg_kwargs = dict(
-    quant_bits=BITS,
-    backend=BACKEND,
+    quant_bits=bits,
+    backend=backend,
     dataset=calib_dataset_cfg,
-    pct_stats_out=pct_stats_out,
-    pct_hi_lo_out=pct_hi_lo_out,
-    pct_summary_out=pct_summary_out,
+    pct_stats_out=Path(os.environ["PCT_STATS_OUT"]),
+    pct_hi_lo_out=Path(os.environ["PCT_HI_LO_PATH"]),
+    pct_summary_out=Path(os.environ["PCT_SUMMARY_OUT"]),
 )
 
-if SMOKE == 1:
+if smoke == 1:
     cfg = QuantCalibrateConfig(
         **base_cfg_kwargs,
         per_device_batch_size=2,
@@ -179,21 +180,45 @@ if SMOKE == 1:
         max_samples_per_module=200_000,
     )
 else:
-    cfg = QuantCalibrateConfig(
-        **base_cfg_kwargs,
-        # 正式校正：其餘超參數用 QuantCalibrateConfig 預設
-    )
+    cfg = QuantCalibrateConfig(**base_cfg_kwargs)
 
 print(
-    f"[QuantCalibrate] Running with quant_bits={cfg.quant_bits}, backend={cfg.backend}, "
-    f"resolved act_bits={cfg.act_bits}, smoke={SMOKE}, "
-    f"pct_stats_out={cfg.pct_stats_out}, pct_hi_lo_out={cfg.pct_hi_lo_out}"
+    f"[QuantCalibrate] bits={cfg.quant_bits} backend={cfg.backend} "
+    f"act_bits={cfg.act_bits} llm_act_mode={llm_act_mode} "
+    f"llm_act_config_tag={llm_act_config_tag} "
+    f"pct_hi_lo_out={cfg.pct_hi_lo_out}"
 )
 quant_calibrate(cfg)
-__PY__
-
-  echo "[STEP] Calibration finished."
+PY
 fi
 
-echo "[DONE] cobra_1115 PTQ script complete (MODE=${MODE}, BITS=${BITS}, SMOKE=${SMOKE})."
+if [[ "${MODE}" == "act_klt" ]]; then
+  python - <<'PY'
+import os
+from pathlib import Path
 
+from cobra.switches.quant_act_klt_outproj import (
+    QuantActKLTOutProjConfig,
+    quant_act_klt_outproj,
+)
+
+cfg = QuantActKLTOutProjConfig(
+    stage=os.environ.get("STAGE", "finetune"),
+    hf_token=Path(os.environ.get("HF_TOKEN_PATH", ".hf_token")),
+    act_klt_in_out=Path(os.environ.get("ACT_KLT_OUTPROJ_IN")),
+    act_klt_out_out=Path(os.environ.get("ACT_KLT_OUTPROJ_OUT")),
+    export_out_feature=(int(os.environ.get("ACT_KLT_EXPORT_OUT_FEATURE", "1")) != 0),
+    block_size=int(os.environ.get("ACT_KLT_BLOCK_SIZE", "512")),
+    max_calib_batches=int(os.environ.get("ACT_KLT_MAX_BATCHES", "0")),
+    max_tokens_per_sample=int(os.environ.get("ACT_KLT_MAX_TOKENS", "128")),
+)
+
+print(
+    f"[QuantActKLTOutProj] block_size={cfg.block_size} "
+    f"in={cfg.act_klt_in_out} out={cfg.act_klt_out_out}"
+)
+quant_act_klt_outproj(cfg)
+PY
+fi
+
+echo "[DONE] cobra_1115_ptq.sh finished."

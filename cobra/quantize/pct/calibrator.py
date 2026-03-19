@@ -47,21 +47,12 @@ from torch import nn
 from cobra.overwatch import initialize_overwatch
 
 from cobra.quantize.quantizer import UniformAffineQuantizer
+from cobra.quantize.targets import CANONICAL_TARGETS
 
 from .schema import compute_affine_params, normalize_target
 from .apply import HiLoRecord, build_hi_lo_map
 
 overwatch = initialize_overwatch(__name__)
-
-
-# Canonical target vocabulary used throughout the PTQ stack.
-_CANONICAL_TARGETS: Tuple[str, ...] = (
-    "fusion",
-    "vision.dino",
-    "vision.siglip",
-    "llm",
-    "projector",
-)
 
 # ---------------------------------------------------------------------------
 # Internal helpers

@@ -17,44 +17,28 @@ Design notes:
 from __future__ import annotations
 
 import re
-from typing import Any, Dict, Iterable, Mapping, Tuple, TypedDict
+from typing import Any, Iterable, Mapping, Tuple, TypedDict
 
 import torch
 
 from cobra.quantize.quantizer import UniformAffineQuantizer
+from cobra.quantize.targets import (
+    CANONICAL_TARGETS,
+    normalize_target as _normalize_target_from_registry,
+)
 
 # ---------------------------------------------------------------------------
 # Target normalization
 # ---------------------------------------------------------------------------
 
-ALLOWED_TARGETS = {"fusion", "vision.dino", "vision.siglip", "llm", "projector"}
+ALLOWED_TARGETS = set(CANONICAL_TARGETS)
 
-# Legacy / alias → canonical target mapping
-LEGACY_TARGET_MAP: Dict[str, str] = {
-    # Fusion stage (Point-B)
-    "fusion": "fusion",
-    "fusion_stage": "fusion",
-    "fusionstage": "fusion",
-
-    # Older naming patterns (from previous prototypes / scripts)
-    "vision_backbone.dino": "vision.dino",
-    "vision_backbone.siglip": "vision.siglip",
-    "vision.dinov2": "vision.dino",
-    "vision.siglip_vit": "vision.siglip",
-    "llm_backbone": "llm",
-    "lm_backbone": "llm",
-    "language": "llm",
-    "projector.out": "projector",
-    "proj.out": "projector",
-    "encoder.out": "projector",
-}
 
 def normalize_target(name: str) -> str:
     """
     Map various user / legacy target names to the canonical vocabulary.
 
     Canonical targets:
-        - "fusion"
         - "vision.dino"
         - "vision.siglip"
         - "llm"
@@ -63,39 +47,8 @@ def normalize_target(name: str) -> str:
     Raises:
         KeyError: if the name cannot be normalized.
     """
-    raw = (name or "").strip()
+    return _normalize_target_from_registry(name)
 
-    # tolerate "target::foo" style prefixes
-    if "::" in raw:
-        raw = raw.split("::", 1)[-1]
-
-    # strip whitespace & lower for matching
-    raw_stripped = raw.replace(" ", "")
-    lowered = raw_stripped.lower()
-
-    # exact canonical
-    if raw_stripped in ALLOWED_TARGETS:
-        return raw_stripped
-
-    # exact legacy mapping
-    if raw_stripped in LEGACY_TARGET_MAP:
-        return LEGACY_TARGET_MAP[raw_stripped]
-    if lowered in LEGACY_TARGET_MAP:
-        return LEGACY_TARGET_MAP[lowered]
-
-    # heuristic fallbacks based on substrings
-    if "fusion" in lowered:
-        return "fusion"
-    if "dino" in lowered:
-        return "vision.dino"
-    if "siglip" in lowered:
-        return "vision.siglip"
-    if "projector" in lowered or lowered.endswith(".out"):
-        return "projector"
-    if "llm" in lowered or "gpt" in lowered or "language" in lowered:
-        return "llm"
-
-    raise KeyError(f"Unrecognized percentile target name: {name!r}")
 
 def normalize_stage(name: str) -> str:
     """
@@ -248,8 +201,6 @@ def compute_affine_params(
     if bits < 2 or bits > 16:
         raise ValueError(f"Unsupported bitwidth: {bits}")
 
-    # `symmetric=True` + `disable_zero_point=True` gives a symmetric, signed
-    # quantizer; the zero_point is effectively 0 in that case.
     quant = UniformAffineQuantizer(
         n_bits=bits,
         symmetric=signed,
@@ -258,19 +209,13 @@ def compute_affine_params(
         is_weight=False,
     )
 
-    xmin_t = torch.tensor(float(x_min))
-    xmax_t = torch.tensor(float(x_max))
+    x = torch.tensor([float(x_min), float(x_max)], dtype=torch.float32)
+    quant.per_token_dynamic_calibration(x)
 
-    if signed:
-        quant.symmetric_cal_scale(xmin_t, xmax_t)
-    else:
-        quant.assymmetric_cal_scale(xmin_t, xmax_t)
-
-    scale = float(quant.scale.item())
+    scale = float(quant.scale.detach().reshape(-1)[0].item())
     if quant.round_zero_point is None:
         zero_point = 0
     else:
-        zero_point = int(quant.round_zero_point.item())
+        zero_point = int(quant.round_zero_point.detach().reshape(-1)[0].item())
 
     return scale, zero_point
-
